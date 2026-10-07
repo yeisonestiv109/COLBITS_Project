@@ -1,18 +1,22 @@
 # Requirements & Design Presentation, Part 2 (sections 8–14)
 
 **Presenter:** Yeison Delgado · **Date:** Wed, Oct 7, 2026 · 10:27–10:49 Colombia / 17:27–17:49 Sweden
-**Slides:** `Requirements_and_Design_Part2_v0.1.pptx` (11 slides; the script is also in each slide's speaker notes)
-**Target time for Part 2:** about 7 minutes. Javier's part 1 takes about 8 minutes, and the whole talk has 15.
+**Slides:** `Requirements_and_Design_Part2_v0.2.pptx`: 9 slides in the same style as Javier's deck (`COLBITS_Requirements_and_Design`). They go in as **slides 19–27**, between Javier's slide 18 ("How we will validate the requirements") and his "Thank you" slide.
+**Target time:** about 7 minutes. Javier's part takes about 8.
 
 ---
 
-## 0. Before uploading to Teams (checklist)
+## 0. What to do (in order)
 
-- [ ] Copy the 11 slides into Javier's deck after section 7. In PowerPoint, choose **Paste → Keep Source Formatting**.
-- [ ] **Slide 4 (mockups):** replace the three "Figma screenshot" boxes with the real screenshots (see section 10).
-- [ ] **Tell Mahmoud:** slide 7 uses a corrected version of his Sequence Diagram 2. In his original, step 4 wrote fault classifications **into Colbits' TimescaleDB**. That contradicts NF-03 (read-only) and the decomposition diagram, where our state goes to "Platform-managed data". The new version writes to our own tables, and every other step is the same. His original is kept at `diagrams/Sequence_2_original.png`.
-- [ ] **Tell Javier and Mahmoud:** sections 13 and 14 fix the stack as **Python + FastAPI** for the backend. If the backend repo already uses something else, change the "Backend REST API" column on slide 10 and the matching rows on slide 8.
-- [ ] File name for Teams under the README convention: `Requirements_and_Design_v1.0.pptx` (the version becomes v1.0 on upload).
+1. Open Javier's deck (`COLBITS_Requirements_and_Design.pptx`, in Teams → 06_Presentations/2026-10-07_Requirements_and_Design) and my `Requirements_and_Design_Part2_v0.2.pptx`.
+2. In mine, select the 9 slides in the left panel and copy them (Ctrl+C).
+3. In Javier's deck, click between slide 18 and the "Thank you" slide, then paste with **Keep Source Formatting** (Ctrl+V, then the clipboard icon → "Keep source formatting"). The speaker notes come along.
+4. **Slide 11 of Javier's deck (Sprint 2 · Team Workload):** your row is empty. Type: Documentation **2**, Presentation **2**, Research **3**, Implementation **0**, Testing **1**, Scrum **1** (Meetings is already 5). Fill in the same row in `COLBITS_Sprint_Documentation_Template.pptx`.
+5. Check the "Thank you" slide number (it currently shows 29; after pasting it should be 28).
+6. Save and upload to Teams as `Requirements_and_Design_v1.0.pptx`.
+7. Tell Mahmoud and Javier, in one message:
+   - Slide 24 uses a **corrected Sequence 2**. In the original, step 4 wrote into Colbits' TimescaleDB, which contradicts NF-03. Now it writes to our tables.
+   - Sections 13 and 14 define the stack as **Python + FastAPI** for the backend. If the backend repo already uses something else, change slide 27 and the matching row on slide 25.
 
 ---
 
@@ -85,19 +89,17 @@ Also decided, because the requirements already imply it:
 
 ## 3. English speaker script (also in the slide notes)
 
-> Speak slowly. The times in brackets are targets. If you are running late, shorten slides 2 and 9 first.
+> Speak calmly. Targets in brackets; total ≈ 7 min. If short on time, trim slides 19 and 26 first.
 
-**Slide 1: Divider (~10 s)**
-Thank you, Javier. I'll take the second half: the non-functional requirements, our backlog and mockups, and then the architecture: how the system is decomposed, the main flows, the decisions behind it, and the technologies.
-
-**Slide 2: Non-functional requirements (~50 s)**
+**Slide 19 · Non-functional requirements (section 8) (~60 s)**
+Thank you, Javier. I'll take the second half: non-functional requirements, backlog, mockups, and then the architecture.
 Besides what the system does, we have twenty-one non-functional requirements. Each one has a measurable acceptance test. They fall into four groups.
 Performance: a state change in the database must reach the map within twenty seconds, and with fifty concurrent users, ninety-five percent of history queries must answer in under two seconds.
 Security: Colbits' telemetry and alarm tables are read-only for us. We prove it with a test that tries to write and expects a permission error. Passwords are stored as Argon2 or bcrypt hashes, five failed logins lock the account for fifteen minutes, and fifteen idle minutes end the session.
 Flexibility: every business threshold, like the inactivity times or the five-minute grouping window, lives in configuration, so changing it needs no code.
 Testability: API and interface suites that run on generated data, including an explicit test that no user can see data outside their scope. They run in CI on every pull request, with at least eighty percent coverage.
 
-**Slide 3: Initial product backlog (~45 s)**
+**Slide 20 · Initial product backlog (section 9) (~45 s)**
 This is the initial state of the product backlog: twenty-nine user stories, each traced to its requirements, and all still To Do because coding starts in Sprint 3.
 We ordered them by priority and spread them over Sprints 3 to 7.
 Priority 5 is the foundation: the data generator, login, scope, the map and the node colors, in Sprints 3 and 4.
@@ -106,14 +108,13 @@ At the bottom are the extras, including the Spanish chat, which is optional and 
 The chart shows the estimated effort per sprint, around twenty-five to thirty points each, with Sprint 5 a bit lighter.
 Our Sprint 3 goal is concrete: a user logs in and sees the nodes in their scope on the map, colored by fuse state, using generated data.
 
-**Slide 4: Mockups (~40 s)**
-These are our first mockups in Figma. We based them on Colbits' own reference screens and already reviewed them with the client. Their feedback is tracked as tasks in Jira.
-First, live monitoring: the map with clustered nodes colored by state, and next to it the list of active faults, ordered by severity.
-Second, historical analysis: date presets, zone and circuit filters, the indicators, and the export buttons.
-Third, the node detail, which shows each device's state, and the assistant panel, which answers only from predefined questions.
-*(Adjust the third sentence to whatever screens the Figma screenshots show.)*
+**Slide 21 · Initial mockups (section 10) (~45 s)**
+These are our mockups in Figma, version 3. We based them on Colbits' own reference screens and already reviewed them with the client. Their feedback is tracked as tasks in Jira.
+The main screen is live grid monitoring: the map with the fuse and transformer layers, each node colored by state; the node detail with its fuse groups; and on the right, the active faults, ordered by the number of affected customers.
+On the right side: user management, where the administrator creates consultation users and assigns their scope; historical analysis, with date presets, filters, KPIs and charts; and the export center, which shows the traceability header that goes into every XLSX, CSV and PDF file.
+The optional assistant opens as a chat panel over these screens.
 
-**Slide 5: System decomposition (~60 s)**
+**Slide 22 · System decomposition (section 11) (~60 s)**
 Now the architecture. This is the inside of our backend.
 A user, either the administrator or a consultation user, works only in the web frontend, and every action becomes a REST request to one of these six features: export, history, faults and alarms, network state, user administration, and the optional assistant.
 Each feature relies on three shared parts: one checks who is calling, one limits what that user may see, and one reaches the data.
@@ -121,20 +122,20 @@ Features also reuse each other. History uses the same fault rule as the live ala
 The data comes from two places: Colbits' existing database, which we only read, shown in gray, and our own data, like users, their scope and device history.
 For development and demos, our generator fills a separate database with the same structure, so we never touch Colbits' data.
 
-**Slide 6: Sequence 1, secure live map (~35 s)**
+**Slide 23 · Sequence 1, secure live map (section 12) (~35 s)**
 The first sequence is the core flow: secure live monitoring.
 The operator logs in, and the API checks the password hash and returns a token carrying the role and the scope.
 When the map opens, every request carries that token. The API validates it and applies the scope filter on the server before any query runs.
 Then it reads the latest Falcon and SMAC telemetry in read-only mode, computes the color of each node for the fuse and transformer layers, and returns only the nodes this user is allowed to see.
 
-**Slide 7: Sequence 2, faults and reports (~40 s)**
+**Slide 24 · Sequence 2, faults & reports (section 12) (~40 s)**
 The second sequence shows how raw telemetry becomes alarms and reports.
 In the background, a fault engine polls Colbits' database every few seconds. It groups fuse openings on the same fuse set within the five-minute window into single-, two- or three-phase faults, and flags devices that stopped reporting.
 The results are written only to our own tables, never to Colbits' database.
 When an operator asks for thirty days of history, the API checks the scope again, combines the time-series data with our fault history, and the frontend draws the charts.
 For an export, the server computes the indicators itself and adds a traceability header, so two exports with the same filters always give the same numbers.
 
-**Slide 8: Key architectural decisions (~50 s)**
+**Slide 25 · Key architectural decisions (section 13) (~50 s)**
 These are our most important design decisions.
 One: a modular monolith, a single API with feature modules, instead of microservices. With six part-time developers and fourteen weeks, one deployable and one test suite is the realistic choice.
 Two: Colbits' data stays read-only, and our state lives in a separate schema, enforced by a database role that can only SELECT.
@@ -143,21 +144,21 @@ Four: one fault rule, run by a background engine, so every screen shows the same
 Five: the live map uses short polling instead of WebSockets. It meets the twenty-second target and makes the last-refresh warning easy.
 And six: the seeded generator, Docker and CI from day one, so all development and testing works without real data.
 
-**Slide 9: Open technical concerns (~30 s)**
+**Slide 26 · Open technical concerns (section 13) (~30 s)**
 Some technical concerns remain open.
 Performance: we cannot add indexes to Colbits' database, so we will pre-aggregate in our own schema and run the load test early.
 Real-data quirks: SMAC readings are split across three tables and must be joined with a time tolerance, and old repetition fuse IDs exist in history that the generator does not produce.
 The twenty-second end-to-end latency must be measured, not assumed.
 And a few points are still to confirm with Colbits, such as the amber versus yellow color in the mockups.
 
-**Slide 10: Technologies by component (~45 s)**
+**Slide 27 · Technologies by component (section 14) (~45 s)**
 Finally, the technologies, mapped to the components you saw in the diagram.
 The web frontend is React with TypeScript, organized with Atomic Design. The map uses Leaflet with marker clustering, the charts use Recharts, and the live refresh is a ten-second polling query.
 The backend is Python with FastAPI. It generates the API documentation automatically, which is one of our deliverables. Authentication uses JWT and Argon2. Data access uses SQLAlchemy with a read-only database role. The fault engine is a scheduled background job, and exports use openpyxl and WeasyPrint.
 On the data side: PostgreSQL with TimescaleDB, the same engine as Colbits, plus our own schema with versioned migrations. The generator is a Python command-line tool with a fixed seed. Tests use pytest and Playwright, run in GitHub Actions, and everything is packaged with Docker.
 
-**Slide 11: Thank you (~5 s)**
-That's our requirements and design. Thank you. We're happy to take your questions.
+**Slide 28 · Thank you (Javier's slide)**
+That's our requirements and design. Thank you — we're happy to take your questions.
 
 ---
 
