@@ -1,0 +1,26 @@
+sequenceDiagram
+    autonumber
+    participant IoT as IoT Devices (Falcon/SMAC)
+    participant TS as Colbits TimescaleDB (read-only)
+    participant BE as Backend API & Fault Engine
+    participant PD as Platform DB (our tables)
+    participant FE as React Frontend
+    actor Op as Operator
+    IoT->>TS: Stream telemetry & fuse events (existing Colbits pipeline)
+    loop Background processing (every few seconds)
+        BE->>TS: Poll new events & last timestamps (SELECT only)
+        BE->>BE: Group openings per fuse set (< 5 min window) & flag inactivity
+        BE->>PD: Upsert active faults, inactivity alarms & affected clients
+    end
+    Op->>FE: Request 30-day history for Circuit X
+    FE->>BE: GET /api/v1/analytics (Bearer JWT)
+    BE->>BE: Validate token & scope boundary
+    BE->>TS: Query time-series aggregates (scoped)
+    BE->>PD: Read fault history for same scope
+    BE-->>FE: Historical dataset + indicators
+    FE->>Op: Render interactive trend charts
+    Op->>FE: Click "Export PDF / XLSX"
+    FE->>BE: POST /api/v1/reports/generate
+    BE->>BE: Compute indicators server-side & add traceability header
+    BE-->>FE: Stream compiled file
+    FE->>Op: Download document
