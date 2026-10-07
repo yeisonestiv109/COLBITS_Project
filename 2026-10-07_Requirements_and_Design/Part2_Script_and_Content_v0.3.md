@@ -1,14 +1,14 @@
 # Requirements & Design Presentation, Part 2 (sections 8–14)
 
 **Presenter:** Yeison Delgado · **Date:** Wed, Oct 7, 2026 · 10:27–10:49 Colombia / 17:27–17:49 Sweden
-**Slides:** `Requirements_and_Design_Part2_v0.2.pptx`: 9 slides in the same style as Javier's deck (`COLBITS_Requirements_and_Design`). They go in as **slides 19–27**, between Javier's slide 18 ("How we will validate the requirements") and his "Thank you" slide.
+**Slides:** `Requirements_and_Design_Part2_v0.3.pptx`: 9 slides in the same style as Javier's deck (`COLBITS_Requirements_and_Design`). They go in as **slides 19–27**, between Javier's slide 18 ("How we will validate the requirements") and his "Thank you" slide.
 **Target time:** about 7 minutes. Javier's part takes about 8.
 
 ---
 
 ## 0. What to do (in order)
 
-1. Open Javier's deck (`COLBITS_Requirements_and_Design.pptx`, in Teams → 06_Presentations/2026-10-07_Requirements_and_Design) and my `Requirements_and_Design_Part2_v0.2.pptx`.
+1. Open Javier's deck (`COLBITS_Requirements_and_Design.pptx`, in Teams → 06_Presentations/2026-10-07_Requirements_and_Design) and my `Requirements_and_Design_Part2_v0.3.pptx`.
 2. In mine, select the 9 slides in the left panel and copy them (Ctrl+C).
 3. In Javier's deck, click between slide 18 and the "Thank you" slide, then paste with **Keep Source Formatting** (Ctrl+V, then the clipboard icon → "Keep source formatting"). The speaker notes come along.
 4. **Slide 11 of Javier's deck (Sprint 2 · Team Workload):** your row is empty. Type: Documentation **2**, Presentation **2**, Research **3**, Implementation **0**, Testing **1**, Scrum **1** (Meetings is already 5). Fill in the same row in `COLBITS_Sprint_Documentation_Template.pptx`.
@@ -87,78 +87,121 @@ Also decided, because the requirements already imply it:
 
 ---
 
-## 3. English speaker script (also in the slide notes)
+## 3. English speaker script, B2 level (also in the slide notes)
 
-> Speak calmly. Targets in brackets; total ≈ 7 min. If short on time, trim slides 19 and 26 first.
+> Short sentences, simple words, technical only where it is needed. Total ≈ 7 min. Pause briefly between slides.
 
 **Slide 19 · Non-functional requirements (section 8) (~60 s)**
-Thank you, Javier. I'll take the second half: non-functional requirements, backlog, mockups, and then the architecture.
-Besides what the system does, we have twenty-one non-functional requirements. Each one has a measurable acceptance test. They fall into four groups.
-Performance: a state change in the database must reach the map within twenty seconds, and with fifty concurrent users, ninety-five percent of history queries must answer in under two seconds.
-Security: Colbits' telemetry and alarm tables are read-only for us. We prove it with a test that tries to write and expects a permission error. Passwords are stored as Argon2 or bcrypt hashes, five failed logins lock the account for fifteen minutes, and fifteen idle minutes end the session.
-Flexibility: every business threshold, like the inactivity times or the five-minute grouping window, lives in configuration, so changing it needs no code.
-Testability: API and interface suites that run on generated data, including an explicit test that no user can see data outside their scope. They run in CI on every pull request, with at least eighty percent coverage.
+Thank you, Javier. Now I will show you the second half: how well the system must work, our backlog, our mockups, and then the architecture.
+
+Let's start with the non-functional requirements. These are not about what the system does, but about how well it does it. We have twenty-one, and each one has a test, so we can prove it.
+
+They are in four groups.
+
+First, speed. When something changes in the field, the map must show it in less than twenty seconds. And with fifty people using the system at the same time, history queries must answer in under two seconds.
+
+Second, security. We can only read Colbits' data, never change it. Passwords are never saved as plain text, only as secure hashes. After five wrong passwords, the account is locked for fifteen minutes, and after fifteen minutes without activity, you must log in again.
+
+Third, flexibility. All the important numbers, like the inactivity time or the five-minute window for faults, are in a configuration file. Colbits can change them without touching the code.
+
+And fourth, testing. Automatic tests run every time we change the code, and they must cover at least eighty percent of the backend.
 
 **Slide 20 · Initial product backlog (section 9) (~45 s)**
-This is the initial state of the product backlog: twenty-nine user stories, each traced to its requirements, and all still To Do because coding starts in Sprint 3.
-We ordered them by priority and spread them over Sprints 3 to 7.
-Priority 5 is the foundation: the data generator, login, scope, the map and the node colors, in Sprints 3 and 4.
-Priority 4 adds filters, faults and alarms, user management, history and export.
-At the bottom are the extras, including the Spanish chat, which is optional and the first thing we would drop.
-The chart shows the estimated effort per sprint, around twenty-five to thirty points each, with Sprint 5 a bit lighter.
-Our Sprint 3 goal is concrete: a user logs in and sees the nodes in their scope on the map, colored by fuse state, using generated data.
+Here is our product backlog at the start. We have twenty-nine user stories, and each one is linked to the requirements. All of them are still "To Do", because coding starts now, in Sprint 3.
+
+We organized them by priority across five sprints.
+
+Priority five, in dark blue, is the base of the system: the data generator, login, the map and the colors of each node.
+
+Priority four adds faults, history and export.
+
+The last group has extras, like the chat in Spanish. It is optional, so if we run out of time, it is the first thing we drop.
+
+On the chart you can see the effort is balanced: around twenty-five to thirty points per sprint.
+
+And our goal for this sprint is simple: a user logs in and sees their part of the network on the map, with the right colors.
 
 **Slide 21 · Initial mockups (section 10) (~45 s)**
-These are our mockups in Figma, version 3. We based them on Colbits' own reference screens and already reviewed them with the client. Their feedback is tracked as tasks in Jira.
-The main screen is live grid monitoring: the map with the fuse and transformer layers, each node colored by state; the node detail with its fuse groups; and on the right, the active faults, ordered by the number of affected customers.
-On the right side: user management, where the administrator creates consultation users and assigns their scope; historical analysis, with date presets, filters, KPIs and charts; and the export center, which shows the traceability header that goes into every XLSX, CSV and PDF file.
-The optional assistant opens as a chat panel over these screens.
+These are our mockups, made in Figma. We built them from Colbits' own reference screens, and we already showed them to the client. Their feedback is now in Jira as tasks.
+
+The big one is the main screen: live monitoring. You see the map with each pole as a colored point. Red means a fuse is open, yellow means no voltage, gray means the device stopped sending data, and green means everything is OK. When you click a node, you see its details. On the right, there is the list of active faults, with the most serious ones first.
+
+On the right side of the slide, we have three more screens: user management, where the administrator decides who sees what; historical analysis, with charts and indicators; and the export center, to download reports in Excel, CSV or PDF.
 
 **Slide 22 · System decomposition (section 11) (~60 s)**
-Now the architecture. This is the inside of our backend.
-A user, either the administrator or a consultation user, works only in the web frontend, and every action becomes a REST request to one of these six features: export, history, faults and alarms, network state, user administration, and the optional assistant.
-Each feature relies on three shared parts: one checks who is calling, one limits what that user may see, and one reaches the data.
-Features also reuse each other. History uses the same fault rule as the live alarms, so the numbers are identical on every screen.
-The data comes from two places: Colbits' existing database, which we only read, shown in gray, and our own data, like users, their scope and device history.
-For development and demos, our generator fills a separate database with the same structure, so we never touch Colbits' data.
+Now, the architecture. This diagram shows how our system is built inside.
+
+At the top, we have the two types of users. Both of them only use the web page.
+
+Every click on the page sends a request to our backend. Inside the backend, we have six features: the map state, faults and alarms, history, export, user administration, and the optional assistant.
+
+Below them, there are three shared parts that every feature uses. The first one checks who you are. The second one decides what you are allowed to see. And the third one is the only part that talks to the database.
+
+At the bottom, we have the data. The gray one is Colbits' database. We only read it, we never write to it. The green ones are ours: one for users and faults, and one with fake data for development and testing.
+
+So, in short: Colbits' production data is always safe.
 
 **Slide 23 · Sequence 1, secure live map (section 12) (~35 s)**
-The first sequence is the core flow: secure live monitoring.
-The operator logs in, and the API checks the password hash and returns a token carrying the role and the scope.
-When the map opens, every request carries that token. The API validates it and applies the scope filter on the server before any query runs.
-Then it reads the latest Falcon and SMAC telemetry in read-only mode, computes the color of each node for the fuse and transformer layers, and returns only the nodes this user is allowed to see.
+This sequence shows the most important flow: opening the live map safely.
+
+Step one: the user logs in, and the backend gives them a token. Think of it as a digital pass that says who they are and what they can see.
+
+Step two: every request from the map carries that pass.
+
+Step three: the backend checks the pass and applies the filter on the server, not in the browser. So a user can never see data from another zone.
+
+Finally, the backend reads the latest data, calculates the color of each node, and sends back only the nodes that this user is allowed to see.
 
 **Slide 24 · Sequence 2, faults & reports (section 12) (~40 s)**
-The second sequence shows how raw telemetry becomes alarms and reports.
-In the background, a fault engine polls Colbits' database every few seconds. It groups fuse openings on the same fuse set within the five-minute window into single-, two- or three-phase faults, and flags devices that stopped reporting.
-The results are written only to our own tables, never to Colbits' database.
-When an operator asks for thirty days of history, the API checks the scope again, combines the time-series data with our fault history, and the frontend draws the charts.
-For an export, the server computes the indicators itself and adds a traceability header, so two exports with the same filters always give the same numbers.
+The second sequence shows how raw data becomes alarms and reports.
+
+On top, in the loop, there is a process that runs in the background every few seconds. It reads the new events from Colbits' database. Then it groups the fuses that opened within five minutes into one fault, and it decides if it is a single-, two- or three-phase fault. It also detects devices that stopped sending data.
+
+The important detail: it saves the results in our own database, never in Colbits' database.
+
+After that, when a user asks for one month of history, the backend checks their permissions again and sends the data for the charts.
+
+And when they export a report, the server calculates everything. So the same filters always give the same numbers.
 
 **Slide 25 · Key architectural decisions (section 13) (~50 s)**
-These are our most important design decisions.
-One: a modular monolith, a single API with feature modules, instead of microservices. With six part-time developers and fourteen weeks, one deployable and one test suite is the realistic choice.
-Two: Colbits' data stays read-only, and our state lives in a separate schema, enforced by a database role that can only SELECT.
-Three: scope is enforced in one place, the data-access layer on the server, so nothing can leak, not even through a count or a total.
-Four: one fault rule, run by a background engine, so every screen shows the same numbers and queries stay fast.
-Five: the live map uses short polling instead of WebSockets. It meets the twenty-second target and makes the last-refresh warning easy.
-And six: the seeded generator, Docker and CI from day one, so all development and testing works without real data.
+These are our six most important decisions, and why we made them.
+
+One: we build one single backend, divided into modules, and not microservices. We are six students working part-time for fourteen weeks, so we need something simple to build, test and deploy.
+
+Two: Colbits' data is read-only. Our own data lives in a separate space. The database itself blocks any writing, so it is not only a promise.
+
+Three: the permission filter lives in one single place, on the server. One place is easier to protect, and easier to test.
+
+Four: faults are calculated once, in the background. That way, every screen shows the same numbers, and the app stays fast.
+
+Five: the map asks for new data every ten seconds. It is simpler than a live connection, and it is fast enough for the twenty-second goal.
+
+And six: we use fake data, Docker and automatic tests from day one, so we never depend on the real database to work.
 
 **Slide 26 · Open technical concerns (section 13) (~30 s)**
-Some technical concerns remain open.
-Performance: we cannot add indexes to Colbits' database, so we will pre-aggregate in our own schema and run the load test early.
-Real-data quirks: SMAC readings are split across three tables and must be joined with a time tolerance, and old repetition fuse IDs exist in history that the generator does not produce.
-The twenty-second end-to-end latency must be measured, not assumed.
-And a few points are still to confirm with Colbits, such as the amber versus yellow color in the mockups.
+Of course, some risks are still open.
+
+First, performance. We can't optimize Colbits' database, because we can't change it. So we will prepare the heavy calculations in our own database, and we will test the speed early.
+
+Second, the real data has some unusual details. For example, one transformer reading is split across three tables.
+
+Third, we must measure the twenty-second goal, not just assume it.
+
+And finally, we still need to confirm a few small details with Colbits, like the exact colors in the mockups.
 
 **Slide 27 · Technologies by component (section 14) (~45 s)**
-Finally, the technologies, mapped to the components you saw in the diagram.
-The web frontend is React with TypeScript, organized with Atomic Design. The map uses Leaflet with marker clustering, the charts use Recharts, and the live refresh is a ten-second polling query.
-The backend is Python with FastAPI. It generates the API documentation automatically, which is one of our deliverables. Authentication uses JWT and Argon2. Data access uses SQLAlchemy with a read-only database role. The fault engine is a scheduled background job, and exports use openpyxl and WeasyPrint.
-On the data side: PostgreSQL with TimescaleDB, the same engine as Colbits, plus our own schema with versioned migrations. The generator is a Python command-line tool with a fixed seed. Tests use pytest and Playwright, run in GitHub Actions, and everything is packaged with Docker.
+And finally, the technologies, one column per part of the diagram.
+
+For the frontend, we use React with TypeScript. The map uses Leaflet, which is free and groups nearby points when you zoom out. Charts are made with Recharts.
+
+For the backend, we use Python with FastAPI. One big advantage: it creates the API documentation automatically, and that is one of our deliverables. Login uses JWT tokens, and passwords are protected with Argon2. The fault engine is a background job, and reports are created with standard Python libraries.
+
+For data, we use PostgreSQL with TimescaleDB, the same database Colbits already uses. Our fake data generator is also in Python. Tests run automatically on GitHub, and everything runs in Docker, so any team member can start the project with one command.
+
+That's all from my side.
 
 **Slide 28 · Thank you (Javier's slide)**
-That's our requirements and design. Thank you — we're happy to take your questions.
+Thank you very much. We are happy to answer your questions.
 
 ---
 
