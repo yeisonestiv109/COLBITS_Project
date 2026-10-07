@@ -92,24 +92,20 @@ Also decided, because the requirements already imply it:
 > Short sentences, simple words, technical only where it is needed. Total ≈ 7 min. Pause briefly between slides.
 
 **Slide 19 · Non-functional requirements (section 8) (~60 s)**
-Thank you, Javier. Now I will show you the second half: how well the system must work, our backlog, our mockups, and then the architecture.
+Thank you, Javier. Now I will present the second half: requirements, backlog, mockups and architecture.
 
-Let's start with the non-functional requirements. These are not about what the system does, but about how well it does it. We have twenty-one, and each one has a test, so we can prove it.
-
-They are in four groups.
+Let's start with the non-functional requirements. They are not about what the system does, but how well it does it. We have twenty-one, in four groups, and each one has a test.
 
 First, speed. When something changes in the field, the map must show it in less than twenty seconds. And with fifty people using the system at the same time, history queries must answer in under two seconds.
 
 Second, security. We can only read Colbits' data, never change it. Passwords are never saved as plain text, only as secure hashes. After five wrong passwords, the account is locked for fifteen minutes, and after fifteen minutes without activity, you must log in again.
 
-Third, flexibility. All the important numbers, like the inactivity time or the five-minute window for faults, are in a configuration file. Colbits can change them without touching the code.
+Third, flexibility. All the important numbers, like the inactivity time or the five-minute window for faults, are in a configuration file. They can change without touching the code.
 
 And fourth, testing. Automatic tests run every time we change the code, and they must cover at least eighty percent of the backend.
 
 **Slide 20 · Initial product backlog (section 9) (~45 s)**
-Here is our product backlog at the start. We have twenty-nine user stories, and each one is linked to the requirements. All of them are still "To Do", because coding starts now, in Sprint 3.
-
-We organized them by priority across five sprints.
+Here is our initial product backlog: twenty-nine user stories, each linked to the requirements. All are still "To Do", because coding starts now, in Sprint 3.
 
 Priority five, in dark blue, is the base of the system: the data generator, login, the map and the colors of each node.
 
@@ -122,22 +118,20 @@ On the chart you can see the effort is balanced: around twenty-five to thirty po
 And our goal for this sprint is simple: a user logs in and sees their part of the network on the map, with the right colors.
 
 **Slide 21 · Initial mockups (section 10) (~45 s)**
-These are our mockups, made in Figma. We built them from Colbits' own reference screens, and we already showed them to the client. Their feedback is now in Jira as tasks.
+These are our mockups, made in Figma. We based them on Colbits' reference screens and already reviewed them with the client.
 
 The big one is the main screen: live monitoring. You see the map with each pole as a colored point. Red means a fuse is open, yellow means no voltage, gray means the device stopped sending data, and green means everything is OK. When you click a node, you see its details. On the right, there is the list of active faults, with the most serious ones first.
 
-On the right side of the slide, we have three more screens: user management, where the administrator decides who sees what; historical analysis, with charts and indicators; and the export center, to download reports in Excel, CSV or PDF.
+On the right, three more screens: user management, where the administrator decides who sees what; historical analysis, with charts and indicators; and the export center, to download reports in Excel, CSV or PDF.
 
 **Slide 22 · System decomposition (section 11) (~60 s)**
 Now, the architecture. This diagram shows how our system is built inside.
 
-At the top, we have the two types of users. Both of them only use the web page.
-
-Every click on the page sends a request to our backend. Inside the backend, we have six features: the map state, faults and alarms, history, export, user administration, and the optional assistant.
+At the top are the two types of users. Both only use the web page, and every click sends a request to our backend. Inside the backend, we have six features: the map state, faults and alarms, history, export, user administration, and the optional assistant.
 
 Below them, there are three shared parts that every feature uses. The first one checks who you are. The second one decides what you are allowed to see. And the third one is the only part that talks to the database.
 
-At the bottom, we have the data. The gray one is Colbits' database. We only read it, we never write to it. The green ones are ours: one for users and faults, and one with fake data for development and testing.
+At the bottom is the data. The gray one is Colbits' database: we only read it, never write to it. The green ones are ours: one for users and faults, and one with fake data for development and testing.
 
 So, in short: Colbits' production data is always safe.
 
@@ -155,18 +149,18 @@ Finally, the backend reads the latest data, calculates the color of each node, a
 **Slide 24 · Sequence 2, faults & reports (section 12) (~40 s)**
 The second sequence shows how raw data becomes alarms and reports.
 
-On top, in the loop, there is a process that runs in the background every few seconds. It reads the new events from Colbits' database. Then it groups the fuses that opened within five minutes into one fault, and it decides if it is a single-, two- or three-phase fault. It also detects devices that stopped sending data.
+In the loop at the top, a background process runs every few seconds. It reads the new events from Colbits' database. Then it groups the fuses that opened within five minutes into one fault, and it decides if it is a single-, two- or three-phase fault. It also detects devices that stopped sending data.
 
 The important detail: it saves the results in our own database, never in Colbits' database.
 
-After that, when a user asks for one month of history, the backend checks their permissions again and sends the data for the charts.
+When a user asks for one month of history, the backend checks their permissions again and sends the data for the charts.
 
 And when they export a report, the server calculates everything. So the same filters always give the same numbers.
 
 **Slide 25 · Key architectural decisions (section 13) (~50 s)**
-These are our six most important decisions, and why we made them.
+These are our six key decisions, and why we made them.
 
-One: we build one single backend, divided into modules, and not microservices. We are six students working part-time for fourteen weeks, so we need something simple to build, test and deploy.
+One: we build one single backend, divided into modules, and not microservices. We are six part-time students with fourteen weeks, so we need something simple to build and test.
 
 Two: Colbits' data is read-only. Our own data lives in a separate space. The database itself blocks any writing, so it is not only a promise.
 
@@ -196,7 +190,7 @@ For the frontend, we use React with TypeScript. The map uses Leaflet, which is f
 
 For the backend, we use Python with FastAPI. One big advantage: it creates the API documentation automatically, and that is one of our deliverables. Login uses JWT tokens, and passwords are protected with Argon2. The fault engine is a background job, and reports are created with standard Python libraries.
 
-For data, we use PostgreSQL with TimescaleDB, the same database Colbits already uses. Our fake data generator is also in Python. Tests run automatically on GitHub, and everything runs in Docker, so any team member can start the project with one command.
+For data, we use PostgreSQL with TimescaleDB, the same as Colbits. The fake data generator is also in Python. Tests run automatically on GitHub, and everything runs in Docker, so any team member can start the project with one command.
 
 That's all from my side.
 
