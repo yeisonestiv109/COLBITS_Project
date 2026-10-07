@@ -184,7 +184,7 @@ Third, we must measure the twenty-second goal, not just assume it.
 And finally, we still need to confirm a few small details with Colbits, like the exact colors in the mockups.
 
 **Slide 27 · Technologies by component (section 14) (~45 s)**
-And finally, the technologies, one column per part of the diagram.
+Last, the technologies, one column per part of the diagram.
 
 For the frontend, we use React with TypeScript. The map uses Leaflet, which is free and groups nearby points when you zoom out. Charts are made with Recharts.
 
