@@ -1,0 +1,493 @@
+From 5828301f5355f295c0e9723415a86983166e442f Mon Sep 17 00:00:00 2001
+From: Yeison Delgado <yeisonestivendelgado109@gmail.com>
+Date: Tue, 20 Oct 2026 02:58:04 +0000
+Subject: [PATCH 1/2] feat(nodes): flag nodes whose SMAC is inactive (F-37)
+
+A SMAC is inactive when it has no record, or when its newest record across
+last_smac_vc/pw/pf_values is older than SMAC_INACTIVITY_HOURS (3 h by
+default, invalid values fall back to 3). GET /nodes now returns
+smac_inactive per node: true/false, or null when the node has no
+transformer. Falcon and SMAC thresholds share one config reader.
+
+Unit tests cover the mapping and the threshold; an e2e test runs the
+query on the isolated test database (2 h, 4 h, no record, newest table
+wins, mixed transformers, no device).
+---
+ backend/src/nodes/nodes.service.spec.ts  |  99 +++++++++++--
+ backend/src/nodes/nodes.service.ts       |  50 ++++++-
+ backend/src/nodes/smac-state.ts          |  30 ++++
+ backend/test/smac-inactivity.e2e-spec.ts | 179 +++++++++++++++++++++++
+ 4 files changed, 340 insertions(+), 18 deletions(-)
+ create mode 100644 backend/src/nodes/smac-state.ts
+ create mode 100644 backend/test/smac-inactivity.e2e-spec.ts
+
+diff --git a/backend/src/nodes/nodes.service.spec.ts b/backend/src/nodes/nodes.service.spec.ts
+index b030912..fc6233e 100644
+--- a/backend/src/nodes/nodes.service.spec.ts
++++ b/backend/src/nodes/nodes.service.spec.ts
+@@ -2,11 +2,14 @@ import { ConfigService } from '@nestjs/config';
+ import { Repository } from 'typeorm';
+ import { Node } from './node.entity';
+ import { NodesService } from './nodes.service';
++import { SMAC_INACTIVITY_SQL } from './smac-state';
+ 
+ function serviceWith(
+   nodes: Partial<Node>[],
+   summaries: unknown[],
+   falconHours?: string,
++  smacRows: unknown[] = [],
++  smacHours?: string,
+ ) {
+   const builder = {
+     select: jest.fn().mockReturnThis(),
+@@ -17,9 +20,15 @@ function serviceWith(
+   };
+   const repository = {
+     createQueryBuilder: jest.fn().mockReturnValue(builder),
+-    query: jest.fn().mockResolvedValue(summaries),
++    query: jest.fn((sql: string) =>
++      Promise.resolve(sql === SMAC_INACTIVITY_SQL ? smacRows : summaries),
++    ),
+   };
+-  const config = { get: jest.fn().mockReturnValue(falconHours) };
++  const env: Record<string, string | undefined> = {
++    FALCON_INACTIVITY_HOURS: falconHours,
++    SMAC_INACTIVITY_HOURS: smacHours,
++  };
++  const config = { get: jest.fn((key: string) => env[key]) };
+   const service = new NodesService(
+     repository as unknown as Repository<Node>,
+     config as unknown as ConfigService,
+@@ -60,8 +69,8 @@ describe('NodesService.findAll (US4 + US6)', () => {
+     expect(result).toEqual({
+       count: 2,
+       nodes: [
+-        { ...N1, fuse_state: 'NORMAL' },
+-        { ...N2, fuse_state: 'CRITICAL' },
++        { ...N1, fuse_state: 'NORMAL', smac_inactive: null },
++        { ...N2, fuse_state: 'CRITICAL', smac_inactive: null },
+       ],
+     });
+   });
+@@ -79,11 +88,10 @@ describe('NodesService.findAll (US4 + US6)', () => {
+ 
+     await service.findAll({ kind: 'unrestricted' });
+ 
+-    expect(repository.query).toHaveBeenCalledWith(expect.any(String), [
+-      [N1.name],
+-      'Abierto',
+-      6,
+-    ]);
++    expect(repository.query).toHaveBeenCalledWith(
++      expect.not.stringMatching(/last_smac/),
++      [[N1.name], 'Abierto', 6],
++    );
+   });
+ 
+   it('falls back to 9 hours when the threshold is missing or invalid', async () => {
+@@ -91,11 +99,10 @@ describe('NodesService.findAll (US4 + US6)', () => {
+ 
+     await service.findAll({ kind: 'unrestricted' });
+ 
+-    expect(repository.query).toHaveBeenCalledWith(expect.any(String), [
+-      [N1.name],
+-      'Abierto',
+-      9,
+-    ]);
++    expect(repository.query).toHaveBeenCalledWith(
++      expect.not.stringMatching(/last_smac/),
++      [[N1.name], 'Abierto', 9],
++    );
+   });
+ 
+   it('skips the state query when the scope has no nodes', async () => {
+@@ -107,3 +114,67 @@ describe('NodesService.findAll (US4 + US6)', () => {
+     expect(repository.query).not.toHaveBeenCalled();
+   });
+ });
++
++describe('NodesService.findAll · SMAC inactivity (US5 · F-37)', () => {
++  it('marks each node with transformers as SMAC-inactive or not, and null for nodes without one', async () => {
++    const N3 = { name: '0000100003', latitude: 3.3, longitude: -75.3 };
++    const { service } = serviceWith([N1, N2, N3], [], undefined, [
++      { node_id: N1.name, any_inactive: false },
++      { node_id: N2.name, any_inactive: true },
++    ]);
++
++    const result = await service.findAll({ kind: 'unrestricted' });
++
++    expect(result.nodes.map((n) => [n.name, n.smac_inactive])).toEqual([
++      [N1.name, false],
++      [N2.name, true],
++      [N3.name, null],
++    ]);
++  });
++
++  it('passes the node ids and the configured SMAC threshold to the SMAC query', async () => {
++    const { service, repository } = serviceWith([N1], [], undefined, [], '5');
++
++    await service.findAll({ kind: 'unrestricted' });
++
++    expect(repository.query).toHaveBeenCalledWith(SMAC_INACTIVITY_SQL, [
++      [N1.name],
++      5,
++    ]);
++  });
++
++  it.each(['abc', '0', '-2', undefined])(
++    'falls back to 3 hours when SMAC_INACTIVITY_HOURS is %p',
++    async (value) => {
++      const { service, repository } = serviceWith(
++        [N1],
++        [],
++        undefined,
++        [],
++        value,
++      );
++
++      await service.findAll({ kind: 'unrestricted' });
++
++      expect(repository.query).toHaveBeenCalledWith(SMAC_INACTIVITY_SQL, [
++        [N1.name],
++        3,
++      ]);
++    },
++  );
++
++  it('keeps the Falcon and SMAC thresholds independent', async () => {
++    const { service, repository } = serviceWith([N1], [], '12', [], '1');
++
++    await service.findAll({ kind: 'unrestricted' });
++
++    expect(repository.query).toHaveBeenCalledWith(
++      expect.not.stringMatching(/last_smac/),
++      [[N1.name], 'Abierto', 12],
++    );
++    expect(repository.query).toHaveBeenCalledWith(SMAC_INACTIVITY_SQL, [
++      [N1.name],
++      1,
++    ]);
++  });
++});
+diff --git a/backend/src/nodes/nodes.service.ts b/backend/src/nodes/nodes.service.ts
+index 7f7f6af..eb601b9 100644
+--- a/backend/src/nodes/nodes.service.ts
++++ b/backend/src/nodes/nodes.service.ts
+@@ -12,6 +12,10 @@ import {
+   NodeState,
+   deriveFuseState,
+ } from './fuse-state';
++import {
++  DEFAULT_SMAC_INACTIVITY_HOURS,
++  SMAC_INACTIVITY_SQL,
++} from './smac-state';
+ 
+ interface FuseSummaryRow {
+   node_id: string;
+@@ -21,12 +25,19 @@ interface FuseSummaryRow {
+   any_inactive: boolean;
+ }
+ 
++interface SmacInactivityRow {
++  node_id: string;
++  any_inactive: boolean;
++}
++
+ export interface NodeView {
+   name: string;
+   latitude: number | null;
+   longitude: number | null;
+   /** US6: fuse-layer colour; null when the node has no fuses. */
+   fuse_state: NodeState | null;
++  /** US5 · F-37: true when a SMAC on the node is inactive; null when the node has no transformer. */
++  smac_inactive: boolean | null;
+ }
+ 
+ /**
+@@ -70,13 +81,16 @@ export class NodesService {
+     applyNodeScope(countQuery, 'node.name', scope);
+ 
+     const count = await countQuery.getCount();
+-    const fuseStates = await this.fuseStatesFor(rows.map((node) => node.name));
++    const nodeNames = rows.map((node) => node.name);
++    const fuseStates = await this.fuseStatesFor(nodeNames);
++    const smacInactivity = await this.smacInactivityFor(nodeNames);
+ 
+     const nodes: NodeView[] = rows.map((node) => ({
+       name: node.name,
+       latitude: node.latitude,
+       longitude: node.longitude,
+       fuse_state: fuseStates.get(node.name) ?? null,
++      smac_inactive: smacInactivity.get(node.name) ?? null,
+     }));
+ 
+     return { count, nodes };
+@@ -106,13 +120,41 @@ export class NodesService {
+     );
+   }
+ 
++  /** US5 · F-37: whether each node has an inactive SMAC (nodes without transformers are absent). */
++  private async smacInactivityFor(
++    nodeNames: string[],
++  ): Promise<Map<string, boolean>> {
++    if (nodeNames.length === 0) return new Map();
++
++    const rows: SmacInactivityRow[] = await this.nodesRepository.query(
++      SMAC_INACTIVITY_SQL,
++      [nodeNames, this.smacInactivityHours()],
++    );
++
++    return new Map(rows.map((row) => [row.node_id, row.any_inactive]));
++  }
++
+   /** NF: threshold configurable without code changes (same variable as DeviceService). */
+   private falconInactivityHours(): number {
+-    const configured = Number(
+-      this.configService.get('FALCON_INACTIVITY_HOURS'),
++    return this.hoursFromConfig(
++      'FALCON_INACTIVITY_HOURS',
++      DEFAULT_FALCON_INACTIVITY_HOURS,
++    );
++  }
++
++  /** NF-07: SMAC threshold, same rules as the Falcon one. */
++  private smacInactivityHours(): number {
++    return this.hoursFromConfig(
++      'SMAC_INACTIVITY_HOURS',
++      DEFAULT_SMAC_INACTIVITY_HOURS,
+     );
++  }
++
++  /** A positive number of hours from the config, or the default when missing or invalid. */
++  private hoursFromConfig(key: string, fallback: number): number {
++    const configured = Number(this.configService.get(key));
+     return Number.isFinite(configured) && configured > 0
+       ? configured
+-      : DEFAULT_FALCON_INACTIVITY_HOURS;
++      : fallback;
+   }
+ }
+diff --git a/backend/src/nodes/smac-state.ts b/backend/src/nodes/smac-state.ts
+new file mode 100644
+index 0000000..01cb35e
+--- /dev/null
++++ b/backend/src/nodes/smac-state.ts
+@@ -0,0 +1,30 @@
++/**
++ * SMAC inactivity (US5 · F-37, Scope v6.0 §3.3 and RF-ING-01).
++ * A SMAC is inactive when it has no record, or when its most recent record — across
++ * last_smac_vc_values, last_smac_pw_values and last_smac_pf_values, which arrive on separate
++ * LoRaWAN uplinks — is older than the threshold.
++ */
++
++/** Default SMAC inactivity threshold (F-37); overridable with SMAC_INACTIVITY_HOURS (NF-07). */
++export const DEFAULT_SMAC_INACTIVITY_HOURS = 3;
++
++/**
++ * One row per node with transformers: whether any SMAC monitoring them is inactive
++ * (nodes → trafos → last_smac_*_values). A transformer without a device or without records counts as inactive.
++ * GREATEST ignores NULLs, so the newest of the three tables wins; it is NULL only when none has a record.
++ */
++export const SMAC_INACTIVITY_SQL = `
++  SELECT t.node_id,
++         BOOL_OR(s.last_seen IS NULL
++                 OR s.last_seen < now() - $2 * interval '1 hour') AS any_inactive
++  FROM public.trafos t
++  CROSS JOIN LATERAL (
++    SELECT GREATEST(
++             (SELECT recorded_at FROM public.last_smac_vc_values WHERE hw_id = t.current_hw_id),
++             (SELECT recorded_at FROM public.last_smac_pw_values WHERE hw_id = t.current_hw_id),
++             (SELECT recorded_at FROM public.last_smac_pf_values WHERE hw_id = t.current_hw_id)
++           ) AS last_seen
++  ) s
++  WHERE t.node_id = ANY($1)
++  GROUP BY t.node_id
++`;
+diff --git a/backend/test/smac-inactivity.e2e-spec.ts b/backend/test/smac-inactivity.e2e-spec.ts
+new file mode 100644
+index 0000000..5dcb0e9
+--- /dev/null
++++ b/backend/test/smac-inactivity.e2e-spec.ts
+@@ -0,0 +1,179 @@
++import { Test, TestingModule } from '@nestjs/testing';
++import { INestApplication } from '@nestjs/common';
++import { DataSource } from 'typeorm';
++import { AppModule } from '../src/app.module';
++import { NodesService } from '../src/nodes/nodes.service';
++
++// US5 · F-37 against a real database: a SMAC is inactive when it has no record, or when its
++// newest record across last_smac_vc/pw/pf_values is older than SMAC_INACTIVITY_HOURS (3 h).
++// Uses the same isolated database as the F-10 tests and removes every row it creates.
++
++const TEST_DB = 'colbits_f10_test';
++const CIRCUIT_ID = 1; // 'CTO 1' from 02_dummy_inserts.sql
++
++type Reading = { table: 'vc' | 'pw' | 'pf'; hoursAgo: number };
++type Trafo = { hwId: string | null; readings: Reading[] };
++type Fixture = { node: string; trafos: Trafo[]; expected: boolean };
++
++const FIXTURES: Fixture[] = [
++  {
++    node: 'SMACE2E001',
++    trafos: [{ hwId: '05E2E00001', readings: [{ table: 'vc', hoursAgo: 2 }] }],
++    expected: false,
++  },
++  {
++    node: 'SMACE2E002',
++    trafos: [{ hwId: '05E2E00002', readings: [{ table: 'vc', hoursAgo: 4 }] }],
++    expected: true,
++  },
++  {
++    node: 'SMACE2E003',
++    trafos: [{ hwId: '05E2E00003', readings: [] }],
++    expected: true,
++  },
++  {
++    node: 'SMACE2E004',
++    trafos: [
++      {
++        hwId: '05E2E00004',
++        readings: [
++          { table: 'vc', hoursAgo: 5 },
++          { table: 'pw', hoursAgo: 1 },
++        ],
++      },
++    ],
++    expected: false,
++  },
++  {
++    node: 'SMACE2E005',
++    trafos: [
++      { hwId: '05E2E00005', readings: [{ table: 'pf', hoursAgo: 1 }] },
++      { hwId: '05E2E00006', readings: [{ table: 'vc', hoursAgo: 4 }] },
++    ],
++    expected: true,
++  },
++  {
++    node: 'SMACE2E006',
++    trafos: [{ hwId: null, readings: [] }],
++    expected: true,
++  },
++];
++
++const NODES = FIXTURES.map((f) => f.node);
++const HW_IDS = FIXTURES.flatMap((f) => f.trafos.map((t) => t.hwId)).filter(
++  (id): id is string => id !== null,
++);
++const TABLES = {
++  vc: 'smac_vc_values',
++  pw: 'smac_pw_values',
++  pf: 'smac_pf_values',
++} as const;
++
++async function assertTestDatabase(dataSource: DataSource): Promise<void> {
++  const result: Array<{ database_name: string }> = await dataSource.query(
++    'SELECT current_database() AS database_name',
++  );
++  if (result[0]?.database_name !== TEST_DB) {
++    throw new Error(`F-37 E2E tests must use the isolated ${TEST_DB} database`);
++  }
++}
++
++async function removeFixtures(dataSource: DataSource): Promise<void> {
++  for (const table of [
++    'smac_vc_values',
++    'smac_pw_values',
++    'smac_pf_values',
++    'last_smac_vc_values',
++    'last_smac_pw_values',
++    'last_smac_pf_values',
++  ]) {
++    await dataSource.query(`DELETE FROM ${table} WHERE hw_id = ANY($1)`, [
++      HW_IDS,
++    ]);
++  }
++  await dataSource.query('DELETE FROM trafos WHERE node_id = ANY($1)', [NODES]);
++  await dataSource.query('DELETE FROM devices WHERE hw_id = ANY($1)', [HW_IDS]);
++  await dataSource.query('DELETE FROM nodes WHERE name = ANY($1)', [NODES]);
++}
++
++async function createFixtures(dataSource: DataSource): Promise<void> {
++  for (const fixture of FIXTURES) {
++    await dataSource.query(
++      'INSERT INTO nodes (name, circuit_id, latitude, longitude) VALUES ($1, $2, 3.5, -75.5)',
++      [fixture.node, CIRCUIT_ID],
++    );
++    for (const [index, trafo] of fixture.trafos.entries()) {
++      if (trafo.hwId) {
++        await dataSource.query(
++          "INSERT INTO devices (hw_id, device_type) VALUES ($1, 'smac')",
++          [trafo.hwId],
++        );
++      }
++      await dataSource.query(
++        'INSERT INTO trafos (custom_id, node_id, rated_kva, current_hw_id) VALUES ($1, $2, 75, $3)',
++        [`${fixture.node}-T${index + 1}-3`, fixture.node, trafo.hwId],
++      );
++      for (const reading of trafo.readings) {
++        // Inserting into the history table lets Colbits' trigger fill the matching last_smac_* table.
++        await dataSource.query(
++          `INSERT INTO ${TABLES[reading.table]} (hw_id, custom_id, recorded_at) VALUES ($1, $2, now() - $3 * interval '1 hour')`,
++          [trafo.hwId, `${fixture.node}-T${index + 1}-3`, reading.hoursAgo],
++        );
++      }
++    }
++  }
++}
++
++describe('F-37 SMAC inactivity (e2e)', () => {
++  let app: INestApplication;
++  let dataSource: DataSource;
++
++  beforeAll(async () => {
++    if (process.env.DB_NAME !== TEST_DB) {
++      throw new Error(`F-37 E2E tests require DB_NAME=${TEST_DB}`);
++    }
++    const moduleFixture: TestingModule = await Test.createTestingModule({
++      imports: [AppModule],
++    }).compile();
++    app = moduleFixture.createNestApplication();
++    await app.init();
++    dataSource = app.get(DataSource);
++    try {
++      await assertTestDatabase(dataSource);
++      await removeFixtures(dataSource);
++      await createFixtures(dataSource);
++    } catch (error) {
++      await app.close();
++      throw error;
++    }
++  });
++
++  afterAll(async () => {
++    if (!app) return;
++    try {
++      await assertTestDatabase(dataSource);
++      await removeFixtures(dataSource);
++    } finally {
++      await app.close();
++    }
++  });
++
++  it.each(FIXTURES.map((f) => [f.node, f.expected] as const))(
++    'node %s has smac_inactive = %p',
++    async (node, expected) => {
++      const { nodes } = await app
++        .get(NodesService)
++        .findAll({ kind: 'unrestricted' });
++      expect(nodes.find((n) => n.name === node)?.smac_inactive).toBe(expected);
++    },
++  );
++
++  it('gives null to nodes without a transformer', async () => {
++    const { nodes } = await app
++      .get(NodesService)
++      .findAll({ kind: 'unrestricted' });
++    expect(
++      nodes.find((n) => n.name === '0000100001')?.smac_inactive,
++    ).toBeNull();
++  });
++});
+-- 
+2.43.0
+
