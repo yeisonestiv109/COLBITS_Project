@@ -1,0 +1,773 @@
+From 1ae2f0c927bf9b1234be9ea2d38b829aa2ca3c1d Mon Sep 17 00:00:00 2001
+From: Yeison Delgado <yeisonestivendelgado109@gmail.com>
+Date: Fri, 30 Oct 2026 17:34:59 +0000
+Subject: [PATCH] feat(nodes): transformer-layer state per node (US7, F-19 to
+ F-23)
+
+GET /nodes now sends transformer_state: CRITICAL with two or more SMAC
+phases down, WARNING with exactly one, INACTIVE with none down and the SMAC
+inactive, NORMAL otherwise, and null without a transformer. A phase is down
+when its last 05xx21y event is a SET. Phases are counted against the
+transformer's own phase count from its identifier, so a two-phase
+transformer with both phases down is red. A node with several transformers
+takes the most severe state.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012Za94ATKRpuhbxLyQmG5TG
+---
+ backend/src/nodes/dto/nodes.dto.ts          |  10 +
+ backend/src/nodes/nodes.service.spec.ts     |  78 ++++++-
+ backend/src/nodes/nodes.service.ts          |  47 +++-
+ backend/src/nodes/transformer-state.spec.ts | 107 +++++++++
+ backend/src/nodes/transformer-state.ts      | 134 ++++++++++++
+ backend/test/transformer-state.e2e-spec.ts  | 226 ++++++++++++++++++++
+ docs/bitacora-ia/2026-10-30-SCRUM-105.md    |  23 ++
+ 7 files changed, 619 insertions(+), 6 deletions(-)
+ create mode 100644 backend/src/nodes/transformer-state.spec.ts
+ create mode 100644 backend/src/nodes/transformer-state.ts
+ create mode 100644 backend/test/transformer-state.e2e-spec.ts
+ create mode 100644 docs/bitacora-ia/2026-10-30-SCRUM-105.md
+
+diff --git a/backend/src/nodes/dto/nodes.dto.ts b/backend/src/nodes/dto/nodes.dto.ts
+index aaf7c38..42b5f0b 100644
+--- a/backend/src/nodes/dto/nodes.dto.ts
++++ b/backend/src/nodes/dto/nodes.dto.ts
+@@ -39,6 +39,16 @@ export class NodeViewDto {
+       'Whether any SMAC on the node is inactive; null when the node has no transformer.',
+   })
+   smac_inactive: boolean | null;
++
++  @ApiProperty({
++    type: String,
++    enum: [...NODE_STATES],
++    nullable: true,
++    example: 'WARNING',
++    description:
++      "Transformer-layer state (US7). CRITICAL = two or more phases down, WARNING = exactly one, INACTIVE = none down and the SMAC inactive, NORMAL otherwise. Phases are counted against the transformer's own phases. Null when the node has no transformer.",
++  })
++  transformer_state: NodeState | null;
+ }
+ 
+ export class NodesResponseDto {
+diff --git a/backend/src/nodes/nodes.service.spec.ts b/backend/src/nodes/nodes.service.spec.ts
+index fc6233e..81c3f4a 100644
+--- a/backend/src/nodes/nodes.service.spec.ts
++++ b/backend/src/nodes/nodes.service.spec.ts
+@@ -3,6 +3,7 @@ import { Repository } from 'typeorm';
+ import { Node } from './node.entity';
+ import { NodesService } from './nodes.service';
+ import { SMAC_INACTIVITY_SQL } from './smac-state';
++import { TRANSFORMER_SUMMARY_SQL } from './transformer-state';
+ 
+ function serviceWith(
+   nodes: Partial<Node>[],
+@@ -10,6 +11,7 @@ function serviceWith(
+   falconHours?: string,
+   smacRows: unknown[] = [],
+   smacHours?: string,
++  transformerRows: unknown[] = [],
+ ) {
+   const builder = {
+     select: jest.fn().mockReturnThis(),
+@@ -20,9 +22,13 @@ function serviceWith(
+   };
+   const repository = {
+     createQueryBuilder: jest.fn().mockReturnValue(builder),
+-    query: jest.fn((sql: string) =>
+-      Promise.resolve(sql === SMAC_INACTIVITY_SQL ? smacRows : summaries),
+-    ),
++    query: jest.fn((sql: string) => {
++      if (sql === SMAC_INACTIVITY_SQL) return Promise.resolve(smacRows);
++      if (sql === TRANSFORMER_SUMMARY_SQL) {
++        return Promise.resolve(transformerRows);
++      }
++      return Promise.resolve(summaries);
++    }),
+   };
+   const env: Record<string, string | undefined> = {
+     FALCON_INACTIVITY_HOURS: falconHours,
+@@ -69,8 +75,18 @@ describe('NodesService.findAll (US4 + US6)', () => {
+     expect(result).toEqual({
+       count: 2,
+       nodes: [
+-        { ...N1, fuse_state: 'NORMAL', smac_inactive: null },
+-        { ...N2, fuse_state: 'CRITICAL', smac_inactive: null },
++        {
++          ...N1,
++          fuse_state: 'NORMAL',
++          smac_inactive: null,
++          transformer_state: null,
++        },
++        {
++          ...N2,
++          fuse_state: 'CRITICAL',
++          smac_inactive: null,
++          transformer_state: null,
++        },
+       ],
+     });
+   });
+@@ -178,3 +194,55 @@ describe('NodesService.findAll · SMAC inactivity (US5 · F-37)', () => {
+     ]);
+   });
+ });
++
++describe('NodesService.findAll transformer_state (US7)', () => {
++  it('sends the transformer-layer state of each node, null without a transformer', async () => {
++    const { service, repository } = serviceWith(
++      [N1, N2],
++      [],
++      undefined,
++      [],
++      undefined,
++      [
++        {
++          node_id: N2.name,
++          custom_id: `${N2.name}-T1-2`,
++          inactive: false,
++          down_channels: ['A', 'B'],
++        },
++      ],
++    );
++
++    const result = await service.findAll({ kind: 'unrestricted' });
++
++    expect(result.nodes.map((n) => [n.name, n.transformer_state])).toEqual([
++      [N1.name, null],
++      [N2.name, 'CRITICAL'],
++    ]);
++    expect(repository.query).toHaveBeenCalledWith(TRANSFORMER_SUMMARY_SQL, [
++      [N1.name, N2.name],
++      3,
++      '^05[0-9]{2}21[0-9A-Za-z]$',
++    ]);
++  });
++
++  it('uses SMAC_INACTIVITY_HOURS for the gray state and treats a missing channel list as none down', async () => {
++    const { service, repository } = serviceWith([N1], [], undefined, [], '6', [
++      {
++        node_id: N1.name,
++        custom_id: `${N1.name}-T1-3`,
++        inactive: true,
++        down_channels: null,
++      },
++    ]);
++
++    const result = await service.findAll({ kind: 'unrestricted' });
++
++    expect(result.nodes[0].transformer_state).toBe('INACTIVE');
++    expect(repository.query).toHaveBeenCalledWith(TRANSFORMER_SUMMARY_SQL, [
++      [N1.name],
++      6,
++      expect.any(String),
++    ]);
++  });
++});
+diff --git a/backend/src/nodes/nodes.service.ts b/backend/src/nodes/nodes.service.ts
+index e40d536..98f64c0 100644
+--- a/backend/src/nodes/nodes.service.ts
++++ b/backend/src/nodes/nodes.service.ts
+@@ -21,6 +21,12 @@ import {
+   DEFAULT_SMAC_INACTIVITY_HOURS,
+   SMAC_INACTIVITY_SQL,
+ } from './smac-state';
++import {
++  PHASE_DROP_EVENT_PATTERN,
++  TRANSFORMER_SUMMARY_SQL,
++  TransformerSummary,
++  deriveTransformerState,
++} from './transformer-state';
+ 
+ interface FuseSummaryRow {
+   node_id: string;
+@@ -35,6 +41,13 @@ interface SmacInactivityRow {
+   any_inactive: boolean;
+ }
+ 
++interface TransformerSummaryRow {
++  node_id: string;
++  custom_id: string;
++  inactive: boolean;
++  down_channels: string[] | null;
++}
++
+ /**
+  * One row per node with fuses: aggregates the last record of every Falcon installed on it
+  * (nodes → fuses_sets → fuses → last_falcon_values). A Falcon with no record counts as inactive.
+@@ -97,6 +110,7 @@ export class NodesService {
+     const nodeNames = rows.map((node) => node.name);
+     const fuseStates = await this.fuseStatesFor(nodeNames);
+     const smacInactivity = await this.smacInactivityFor(nodeNames);
++    const transformerStates = await this.transformerStatesFor(nodeNames);
+ 
+     const nodes: NodeViewDto[] = rows.map((node) => ({
+       name: node.name,
+@@ -104,6 +118,7 @@ export class NodesService {
+       longitude: node.longitude,
+       fuse_state: fuseStates.get(node.name) ?? null,
+       smac_inactive: smacInactivity.get(node.name) ?? null,
++      transformer_state: transformerStates.get(node.name) ?? null,
+     }));
+ 
+     return { count, nodes };
+@@ -180,6 +195,36 @@ export class NodesService {
+     return new Map(rows.map((row) => [row.node_id, row.any_inactive]));
+   }
+ 
++  /** US7 · F-19 to F-23: transformer-layer state of each node (nodes without transformers are absent). */
++  private async transformerStatesFor(
++    nodeNames: string[],
++  ): Promise<Map<string, NodeState | null>> {
++    if (nodeNames.length === 0) return new Map();
++
++    const rows: TransformerSummaryRow[] = await this.nodesRepository.query(
++      TRANSFORMER_SUMMARY_SQL,
++      [nodeNames, this.smacInactivityHours(), PHASE_DROP_EVENT_PATTERN],
++    );
++
++    const byNode = new Map<string, TransformerSummary[]>();
++    for (const row of rows) {
++      const list = byNode.get(row.node_id) ?? [];
++      list.push({
++        customId: row.custom_id,
++        inactive: row.inactive,
++        downChannels: row.down_channels ?? [],
++      });
++      byNode.set(row.node_id, list);
++    }
++
++    return new Map(
++      [...byNode].map(([node, transformers]) => [
++        node,
++        deriveTransformerState(transformers),
++      ]),
++    );
++  }
++
+   /** threshold configurable without code changes (same variable as DeviceService). */
+   private falconInactivityHours(): number {
+     return this.hoursFromConfig(
+@@ -203,4 +248,4 @@ export class NodesService {
+       ? configured
+       : fallback;
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/backend/src/nodes/transformer-state.spec.ts b/backend/src/nodes/transformer-state.spec.ts
+new file mode 100644
+index 0000000..86eb04b
+--- /dev/null
++++ b/backend/src/nodes/transformer-state.spec.ts
+@@ -0,0 +1,107 @@
++import {
++  PHASE_DROP_EVENT_PATTERN,
++  TransformerSummary,
++  deriveTransformerState,
++  phaseCountOf,
++  phaseOfChannel,
++  phasesDown,
++} from './transformer-state';
++
++const three = (
++  downChannels: string[],
++  inactive = false,
++): TransformerSummary => ({
++  customId: '0000100004-T1-3',
++  inactive,
++  downChannels,
++});
++const two = (downChannels: string[], inactive = false): TransformerSummary => ({
++  customId: '0000100005-T1-2',
++  inactive,
++  downChannels,
++});
++
++describe('deriveTransformerState (US7 · RF-MAP-04)', () => {
++  it('F-19: two or more phases down is CRITICAL', () => {
++    expect(deriveTransformerState([three(['A', 'B'])])).toBe('CRITICAL');
++    expect(deriveTransformerState([three(['A', 'B', 'C'])])).toBe('CRITICAL');
++  });
++
++  it('F-20: exactly one phase down is WARNING', () => {
++    expect(deriveTransformerState([three(['C'])])).toBe('WARNING');
++  });
++
++  it('F-21: no phase down and the SMAC inactive is INACTIVE', () => {
++    expect(deriveTransformerState([three([], true)])).toBe('INACTIVE');
++  });
++
++  it('F-22: no phase down and the SMAC active is NORMAL', () => {
++    expect(deriveTransformerState([three([])])).toBe('NORMAL');
++  });
++
++  it('strict precedence: phases down win over inactivity', () => {
++    expect(deriveTransformerState([three(['A'], true)])).toBe('WARNING');
++    expect(deriveTransformerState([three(['A', 'B'], true)])).toBe('CRITICAL');
++  });
++
++  it('F-23: a two-phase transformer with both phases down is CRITICAL, not WARNING', () => {
++    expect(deriveTransformerState([two(['A', 'B'])])).toBe('CRITICAL');
++  });
++
++  it('F-23: an event on phase C of a two-phase transformer does not count', () => {
++    expect(deriveTransformerState([two(['A', 'C'])])).toBe('WARNING');
++    expect(deriveTransformerState([two(['C'])])).toBe('NORMAL');
++  });
++
++  it('a node with several transformers takes the most severe state', () => {
++    expect(deriveTransformerState([three([]), three(['A'])])).toBe('WARNING');
++    expect(deriveTransformerState([three([], true), three([])])).toBe(
++      'INACTIVE',
++    );
++    expect(deriveTransformerState([three(['A']), two(['A', 'B'])])).toBe(
++      'CRITICAL',
++    );
++  });
++
++  it('is null for a node without transformers (hidden on that layer)', () => {
++    expect(deriveTransformerState([])).toBeNull();
++  });
++});
++
++describe('transformer identifiers and channels (Annex §3.3, §4.2)', () => {
++  it('reads the phase count at the end of the identifier', () => {
++    expect(phaseCountOf('0000226153-T1-3')).toBe(3);
++    expect(phaseCountOf('0000100005-T1-2')).toBe(2);
++    expect(phaseCountOf('0000100005-T1')).toBeNull();
++    expect(phaseCountOf('0000100005-T1-4')).toBeNull();
++  });
++
++  it('accepts letters (seed, generator) and digits (Annex text) as channels', () => {
++    expect(phaseOfChannel('A')).toBe(1);
++    expect(phaseOfChannel('c')).toBe(3);
++    expect(phaseOfChannel('2')).toBe(2);
++    expect(phaseOfChannel('X')).toBeNull();
++  });
++
++  it('counts an unknown channel, but never above the phase count', () => {
++    expect(phasesDown(three(['X']))).toBe(1);
++    expect(phasesDown(two(['A', 'B', 'X']))).toBe(2);
++  });
++
++  it('counts every channel when the identifier has no phase count', () => {
++    expect(
++      phasesDown({
++        customId: 'LEGACY-T1',
++        inactive: false,
++        downChannels: ['A', 'C'],
++      }),
++    ).toBe(2);
++  });
++
++  it('uses the Annex phase-drop pattern (05xx21y), not phase out of range (05xx20y)', () => {
++    const pattern = new RegExp(PHASE_DROP_EVENT_PATTERN);
++    expect(pattern.test('051421C')).toBe(true);
++    expect(pattern.test('051420A')).toBe(false);
++    expect(pattern.test('131421')).toBe(false);
++  });
++});
+diff --git a/backend/src/nodes/transformer-state.ts b/backend/src/nodes/transformer-state.ts
+new file mode 100644
+index 0000000..94891e4
+--- /dev/null
++++ b/backend/src/nodes/transformer-state.ts
+@@ -0,0 +1,134 @@
++import { ALERT_TYPE_DEFINITIONS } from '../faults/fault-alert-types';
++import { NodeState } from './fuse-state';
++
++/**
++ * Transformer-layer colour of a node (US7 · F-19 to F-23, RF-MAP-04 and RF-MAP-05).
++ * Strict precedence over the SMAC phases of the node's transformers:
++ *   CRITICAL (red)    — two or more phases down (a two-phase transformer with both down is red)
++ *   WARNING  (yellow) — exactly one phase down
++ *   INACTIVE (gray)   — no phase down and the SMAC is inactive (F-37, 3 h by default)
++ *   NORMAL   (green)  — otherwise
++ *
++ * A phase is down when its last phase-drop event (Technical Annex §4.2, `05xx21y`) is a SET
++ * without a later CLEAR. Scope v6.0 §3.2: "Phase drop or recovery — per-channel event codes,
++ * with activation and deactivation". "Phase out of range" (05xx20y) does not drop a phase.
++ */
++
++/** Same Annex §4.2 pattern the fault list uses for PHASE_LOSS, valid in JS and in PostgreSQL `~`. */
++export const PHASE_DROP_EVENT_PATTERN = ALERT_TYPE_DEFINITIONS.PHASE_LOSS
++  .eventCodePattern as string;
++
++export interface TransformerSummary {
++  /** trafos.custom_id, e.g. 0000226153-T1-3 (Annex §3.3: node + transformer id + phase count). */
++  customId: string;
++  /** No record, or the newest of the three SMAC tables older than the threshold. */
++  inactive: boolean;
++  /** Channel character (`y`) of every phase-drop event whose last event is a SET. */
++  downChannels: readonly string[];
++}
++
++/**
++ * Phase count of a transformer from its identifier (Annex §3.3, "node(10) + transformer id +
++ * phase count", example 0000226153-T1-3). null when the identifier does not end in 2 or 3.
++ */
++export function phaseCountOf(customId: string): 2 | 3 | null {
++  const match = /-([23])$/.exec(customId);
++  return match ? (Number(match[1]) as 2 | 3) : null;
++}
++
++/**
++ * Phase number (1 to 3) of a channel character. The seed and the generator use A, B, C; the
++ * Annex text calls it a digit, so 1, 2, 3 are accepted too. null when it is neither.
++ */
++export function phaseOfChannel(channel: string): 1 | 2 | 3 | null {
++  const index = ['A', 'B', 'C'].indexOf(channel.toUpperCase());
++  if (index >= 0) return (index + 1) as 1 | 2 | 3;
++  return channel === '1' || channel === '2' || channel === '3'
++    ? (Number(channel) as 1 | 2 | 3)
++    : null;
++}
++
++/**
++ * Phases down on one transformer, counted against the phases it really has (F-23 / RF-MAP-05):
++ * an event on phase C of a two-phase transformer is ignored. A channel that is not a known phase
++ * is still counted (it is an Annex phase-drop event), but never above the phase count.
++ */
++export function phasesDown(summary: TransformerSummary): number {
++  const phaseCount = phaseCountOf(summary.customId);
++  const channels = new Set(
++    summary.downChannels.filter((channel) => {
++      const phase = phaseOfChannel(channel);
++      return phase === null || phaseCount === null || phase <= phaseCount;
++    }),
++  );
++  return phaseCount === null
++    ? channels.size
++    : Math.min(channels.size, phaseCount);
++}
++
++function stateOf(summary: TransformerSummary): NodeState {
++  const down = phasesDown(summary);
++  if (down >= 2) return 'CRITICAL';
++  if (down === 1) return 'WARNING';
++  if (summary.inactive) return 'INACTIVE';
++  return 'NORMAL';
++}
++
++const SEVERITY: Record<NodeState, number> = {
++  CRITICAL: 3,
++  WARNING: 2,
++  INACTIVE: 1,
++  NORMAL: 0,
++};
++
++/**
++ * Node state on the transformer layer: the most severe of its transformers.
++ * null when the node has no transformer, so the frontend hides it on that layer.
++ */
++export function deriveTransformerState(
++  transformers: readonly TransformerSummary[],
++): NodeState | null {
++  if (transformers.length === 0) return null;
++  return transformers
++    .map(stateOf)
++    .reduce<NodeState>(
++      (worst, state) => (SEVERITY[state] > SEVERITY[worst] ? state : worst),
++      'NORMAL',
++    );
++}
++
++/**
++ * One row per transformer of the requested nodes: inactivity (same rule as SMAC_INACTIVITY_SQL)
++ * and the channels whose last phase-drop event is a SET. Events are matched by the stable
++ * transformer identifier (custom_id), or by the device when the event has no custom_id.
++ * At the same instant a CLEAR wins over a SET, so a recovered phase is never reported down.
++ */
++export const TRANSFORMER_SUMMARY_SQL = `
++  SELECT t.node_id, t.custom_id,
++         (s.last_seen IS NULL OR s.last_seen < now() - $2 * interval '1 hour') AS inactive,
++         COALESCE(d.down_channels, '{}') AS down_channels
++  FROM public.trafos t
++  CROSS JOIN LATERAL (
++    SELECT GREATEST(
++             (SELECT recorded_at FROM public.last_smac_vc_values WHERE hw_id = t.current_hw_id),
++             (SELECT recorded_at FROM public.last_smac_pw_values WHERE hw_id = t.current_hw_id),
++             (SELECT recorded_at FROM public.last_smac_pf_values WHERE hw_id = t.current_hw_id)
++           ) AS last_seen
++  ) s
++  LEFT JOIN LATERAL (
++    SELECT array_agg(last_event.channel ORDER BY last_event.channel) AS down_channels
++    FROM (
++      SELECT DISTINCT ON (right(a.event_code, 1))
++             right(a.event_code, 1) AS channel, upper(a.event_type) AS event_type
++      FROM public.alarms a
++      WHERE (a.custom_id = t.custom_id
++             OR (a.custom_id IS NULL AND a.hw_id = t.current_hw_id))
++        AND a.event_code ~ $3
++        AND upper(a.event_type) IN ('SET', 'CLEAR')
++      ORDER BY right(a.event_code, 1), a.recorded_at DESC, (upper(a.event_type) = 'CLEAR') DESC
++    ) last_event
++    WHERE last_event.event_type = 'SET'
++  ) d ON true
++  WHERE t.node_id = ANY($1)
++  ORDER BY t.node_id, t.custom_id
++`;
+diff --git a/backend/test/transformer-state.e2e-spec.ts b/backend/test/transformer-state.e2e-spec.ts
+new file mode 100644
+index 0000000..cdea365
+--- /dev/null
++++ b/backend/test/transformer-state.e2e-spec.ts
+@@ -0,0 +1,226 @@
++import { Test, TestingModule } from '@nestjs/testing';
++import { INestApplication } from '@nestjs/common';
++import { DataSource } from 'typeorm';
++import { AppModule } from '../src/app.module';
++import { NodesService } from '../src/nodes/nodes.service';
++
++// US7 · F-19 to F-23 against a real database: the transformer-layer state of GET /nodes comes from
++// the SMAC phase-drop events in `alarms` (05xx21y, SET / CLEAR) and the SMAC inactivity rule.
++// Uses the isolated database of the F-10 tests and removes every row it creates.
++
++const TEST_DB = 'colbits_f10_test';
++const CIRCUIT_ID = 1;
++
++type Event = {
++  channel: string;
++  type: 'SET' | 'CLEAR';
++  minutesAgo: number;
++  code?: '21' | '20';
++  withoutCustomId?: boolean;
++};
++type Fixture = {
++  node: string;
++  phases: 2 | 3;
++  hoursSinceReading: number;
++  events: Event[];
++  expected: string;
++};
++
++const FIXTURES: Fixture[] = [
++  {
++    node: 'TRE2E00001',
++    phases: 3,
++    hoursSinceReading: 1,
++    events: [],
++    expected: 'NORMAL',
++  },
++  {
++    node: 'TRE2E00002',
++    phases: 3,
++    hoursSinceReading: 1,
++    events: [{ channel: 'A', type: 'SET', minutesAgo: 30 }],
++    expected: 'WARNING',
++  },
++  {
++    node: 'TRE2E00003',
++    phases: 3,
++    hoursSinceReading: 1,
++    events: [
++      { channel: 'A', type: 'SET', minutesAgo: 30 },
++      { channel: 'B', type: 'SET', minutesAgo: 29 },
++    ],
++    expected: 'CRITICAL',
++  },
++  {
++    node: 'TRE2E00004',
++    phases: 2,
++    hoursSinceReading: 1,
++    events: [
++      { channel: 'A', type: 'SET', minutesAgo: 30 },
++      { channel: 'B', type: 'SET', minutesAgo: 29 },
++    ],
++    expected: 'CRITICAL',
++  },
++  {
++    node: 'TRE2E00005',
++    phases: 2,
++    hoursSinceReading: 1,
++    events: [{ channel: 'C', type: 'SET', minutesAgo: 30 }],
++    expected: 'NORMAL',
++  },
++  {
++    node: 'TRE2E00006',
++    phases: 3,
++    hoursSinceReading: 5,
++    events: [],
++    expected: 'INACTIVE',
++  },
++  {
++    node: 'TRE2E00007',
++    phases: 3,
++    hoursSinceReading: 1,
++    events: [
++      { channel: 'A', type: 'SET', minutesAgo: 30 },
++      { channel: 'A', type: 'CLEAR', minutesAgo: 10 },
++    ],
++    expected: 'NORMAL',
++  },
++  {
++    node: 'TRE2E00008',
++    phases: 3,
++    hoursSinceReading: 1,
++    events: [
++      { channel: 'A', type: 'SET', minutesAgo: 30 },
++      { channel: 'B', type: 'SET', minutesAgo: 29, code: '20' },
++    ],
++    expected: 'WARNING',
++  },
++  {
++    node: 'TRE2E00009',
++    phases: 3,
++    hoursSinceReading: 5,
++    events: [
++      { channel: 'A', type: 'SET', minutesAgo: 30, withoutCustomId: true },
++    ],
++    expected: 'WARNING',
++  },
++];
++
++const NODES = FIXTURES.map((f) => f.node);
++const hwIdOf = (node: string) => `05E${node.slice(-7)}`;
++const HW_IDS = NODES.map(hwIdOf);
++const trafoOf = (f: Fixture) => `${f.node}-T1-${f.phases}`;
++
++async function assertTestDatabase(dataSource: DataSource): Promise<void> {
++  const result: Array<{ database_name: string }> = await dataSource.query(
++    'SELECT current_database() AS database_name',
++  );
++  if (result[0]?.database_name !== TEST_DB) {
++    throw new Error(`US7 E2E tests must use the isolated ${TEST_DB} database`);
++  }
++}
++
++async function removeFixtures(dataSource: DataSource): Promise<void> {
++  await dataSource.query('DELETE FROM alarms WHERE hw_id = ANY($1)', [HW_IDS]);
++  for (const table of ['smac_vc_values', 'last_smac_vc_values']) {
++    await dataSource.query(`DELETE FROM ${table} WHERE hw_id = ANY($1)`, [
++      HW_IDS,
++    ]);
++  }
++  await dataSource.query('DELETE FROM trafos WHERE node_id = ANY($1)', [NODES]);
++  await dataSource.query('DELETE FROM devices WHERE hw_id = ANY($1)', [HW_IDS]);
++  await dataSource.query('DELETE FROM nodes WHERE name = ANY($1)', [NODES]);
++}
++
++async function createFixtures(dataSource: DataSource): Promise<void> {
++  for (const f of FIXTURES) {
++    const hwId = hwIdOf(f.node);
++    await dataSource.query(
++      'INSERT INTO nodes (name, circuit_id, latitude, longitude) VALUES ($1, $2, 3.5, -75.5)',
++      [f.node, CIRCUIT_ID],
++    );
++    await dataSource.query(
++      "INSERT INTO devices (hw_id, device_type) VALUES ($1, 'smac')",
++      [hwId],
++    );
++    await dataSource.query(
++      'INSERT INTO trafos (custom_id, node_id, rated_kva, current_hw_id) VALUES ($1, $2, 75, $3)',
++      [trafoOf(f), f.node, hwId],
++    );
++    // Colbits' trigger fills last_smac_vc_values from the history table.
++    await dataSource.query(
++      `INSERT INTO smac_vc_values (hw_id, custom_id, recorded_at) VALUES ($1, $2, now() - $3 * interval '1 hour')`,
++      [hwId, trafoOf(f), f.hoursSinceReading],
++    );
++    for (const e of f.events) {
++      await dataSource.query(
++        `INSERT INTO alarms (hw_id, custom_id, event_code, event_type, alarm, value, recorded_at)
++         VALUES ($1, $2, $3, $4, 'e2e', NULL, now() - $5 * interval '1 minute')`,
++        [
++          hwId,
++          e.withoutCustomId ? null : trafoOf(f),
++          `0514${e.code ?? '21'}${e.channel}`,
++          e.type,
++          e.minutesAgo,
++        ],
++      );
++    }
++  }
++}
++
++describe('US7 transformer-layer state (e2e)', () => {
++  let app: INestApplication;
++  let dataSource: DataSource;
++
++  beforeAll(async () => {
++    if (process.env.DB_NAME !== TEST_DB) {
++      throw new Error(`US7 E2E tests require DB_NAME=${TEST_DB}`);
++    }
++    const moduleFixture: TestingModule = await Test.createTestingModule({
++      imports: [AppModule],
++    }).compile();
++    app = moduleFixture.createNestApplication();
++    await app.init();
++    dataSource = app.get(DataSource);
++    try {
++      await assertTestDatabase(dataSource);
++      await removeFixtures(dataSource);
++      await createFixtures(dataSource);
++    } catch (error) {
++      await app.close();
++      throw error;
++    }
++  });
++
++  afterAll(async () => {
++    if (!app) return;
++    try {
++      await assertTestDatabase(dataSource);
++      await removeFixtures(dataSource);
++    } finally {
++      await app.close();
++    }
++  });
++
++  const stateOf = async (node: string) => {
++    const { nodes } = await app
++      .get(NodesService)
++      .findAll({ kind: 'unrestricted' });
++    return nodes.find((n) => n.name === node)?.transformer_state;
++  };
++
++  it.each(FIXTURES.map((f) => [f.node, f.expected] as const))(
++    'node %s has transformer_state %s',
++    async (node, expected) => {
++      expect(await stateOf(node)).toBe(expected);
++    },
++  );
++
++  it('the seed two-phase transformer with phase C dropped and recovered is only inactive (old data)', async () => {
++    expect(await stateOf('0000100005')).toBe('INACTIVE');
++  });
++
++  it('gives null to nodes without a transformer', async () => {
++    expect(await stateOf('0000100001')).toBeNull();
++  });
++});
+diff --git a/docs/bitacora-ia/2026-10-30-SCRUM-105.md b/docs/bitacora-ia/2026-10-30-SCRUM-105.md
+new file mode 100644
+index 0000000..74789ae
+--- /dev/null
++++ b/docs/bitacora-ia/2026-10-30-SCRUM-105.md
+@@ -0,0 +1,23 @@
++# AI log — SCRUM-105 (US7 · F-19 to F-23 transformer-layer state, backend) — 2026-10-30
++
++**Author:** Yeison Delgado · **Tool:** Claude (Claude Code)
++
++## What the AI generated
++- `backend/src/nodes/transformer-state.ts`: the RF-MAP-04/05 rule (`deriveTransformerState`), the phase
++  count from the transformer identifier, and `TRANSFORMER_SUMMARY_SQL`.
++- `transformer_state` in `GET /nodes` (`nodes.service.ts`, Swagger in `dto/nodes.dto.ts`).
++- Tests: `transformer-state.spec.ts`, new cases in `nodes.service.spec.ts`, e2e `test/transformer-state.e2e-spec.ts`.
++
++## What I did / reviewed
++- Took the rule from Scope v6.0: RF-MAP-04 (red = 2+ phases down, yellow = 1, gray = SMAC inactive, green
++  otherwise), RF-MAP-05 (count against the transformer's own phases) and §3.2 (a phase drop is a per-channel
++  event with activation and deactivation). The phase count comes from Technical Annex §3.3 (`node-T1-3`), and
++  the event codes from §4.2.
++- Reused the `PHASE_LOSS` pattern of the fault list (SCRUM-108), so both features read the same codes.
++- A phase is down when its last `05xx21y` event is SET; a CLEAR at the same instant wins. `05xx20y` (out of
++  range) does not count. Events are matched by the transformer `custom_id`, or by device when it is null.
++- Ran: 396 unit tests, lint, typecheck and build. The e2e test ran on PostgreSQL with Colbits' triggers: 11 new
++  tests, 28 together with the F-10, F-37 and F-29 suites. I loaded generator scenarios (1 phase down, 2 of 2,
++  3 phases, a recovered phase and a silent SMAC) and called the real `GET /nodes`. The results were WARNING,
++  CRITICAL, CRITICAL, NORMAL and INACTIVE, as expected. The frontend already reads `transformer_state`, and it
++  painted the transformer markers with no change.
+-- 
+2.43.0
+
