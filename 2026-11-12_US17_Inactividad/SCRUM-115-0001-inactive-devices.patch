@@ -1,0 +1,1481 @@
+From 314f1963db3e507f5e149b5d305703a713677bae Mon Sep 17 00:00:00 2001
+From: Yeison Delgado <yeisonestivendelgado109@gmail.com>
+Date: Thu, 12 Nov 2026 02:05:28 +0000
+Subject: [PATCH] feat(device): inactive devices with their inactivity alarms
+ (US17, F-38 to F-40, NF-08)
+
+GET /device/inactive?hours=24 lists the devices of the user scope that
+were inactive in the window, with their inactivity periods. A period is
+the device's inactivity alarm: it opens at its previous record plus its
+threshold (F-38) and resolves by itself at its next stored record (F-39);
+end is null while it is open. Devices inactive now come first, oldest
+last record first (F-40), then the ones that reported again. Each device
+also carries its energy level and low_energy against the new settings
+FALCON_LOW_ENERGY_PERCENT and SMAC_LOW_ENERGY_PERCENT (30 % by default,
+NF-08 and client answer CL-11).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012Za94ATKRpuhbxLyQmG5TG
+---
+ backend/.env.example                          |   4 +
+ backend/src/device/device.controller.spec.ts  |  59 +++-
+ backend/src/device/device.controller.ts       |  68 ++++-
+ backend/src/device/device.module.ts           |   5 +-
+ .../src/device/dto/inactive-devices.dto.ts    | 147 ++++++++++
+ .../device/inactive-devices.service.spec.ts   | 186 ++++++++++++
+ .../src/device/inactive-devices.service.ts    | 267 ++++++++++++++++++
+ backend/src/device/inactivity-periods.spec.ts | 158 +++++++++++
+ backend/src/device/inactivity-periods.ts      |  94 ++++++
+ backend/src/device/low-energy.spec.ts         |  36 +++
+ backend/src/device/low-energy.ts              |  32 +++
+ backend/test/inactive-devices.e2e-spec.ts     | 169 +++++++++++
+ deploy/docker-compose.yml                     |   2 +
+ docker-compose.yml                            |   2 +
+ docs/bitacora-ia/2026-11-12-SCRUM-115.md      |  26 ++
+ render.yaml                                   |   8 +
+ 16 files changed, 1259 insertions(+), 4 deletions(-)
+ create mode 100644 backend/src/device/dto/inactive-devices.dto.ts
+ create mode 100644 backend/src/device/inactive-devices.service.spec.ts
+ create mode 100644 backend/src/device/inactive-devices.service.ts
+ create mode 100644 backend/src/device/inactivity-periods.spec.ts
+ create mode 100644 backend/src/device/inactivity-periods.ts
+ create mode 100644 backend/src/device/low-energy.spec.ts
+ create mode 100644 backend/src/device/low-energy.ts
+ create mode 100644 backend/test/inactive-devices.e2e-spec.ts
+ create mode 100644 docs/bitacora-ia/2026-11-12-SCRUM-115.md
+
+diff --git a/backend/.env.example b/backend/.env.example
+index 320e5cb..647b9d5 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -22,3 +22,7 @@ SMAC_INACTIVITY_HOURS=3
+ 
+ # Minutes between fuse openings of one fuse set that still group into one fault (US10, RF-ALR-04)
+ FAULT_GROUPING_WINDOW_MINUTES=5
++
++# Energy level (%) below which a device has low energy (NF-08; Colbits recommends 30)
++FALCON_LOW_ENERGY_PERCENT=30
++SMAC_LOW_ENERGY_PERCENT=30
+diff --git a/backend/src/device/device.controller.spec.ts b/backend/src/device/device.controller.spec.ts
+index 5ddf81b..a24bf0c 100644
+--- a/backend/src/device/device.controller.spec.ts
++++ b/backend/src/device/device.controller.spec.ts
+@@ -3,13 +3,18 @@ import type { Request } from 'express';
+ import { ScopeService } from '../scope/scope.service';
+ import { DeviceController } from './device.controller';
+ import { DeviceService } from './device.service';
++import { InactiveDevicesService } from './inactive-devices.service';
+ 
+ describe('DeviceController', () => {
+   const checkInactivity = jest.fn().mockResolvedValue({ isInactive: false });
+   const resolve = jest.fn().mockResolvedValue({ kind: 'unrestricted' });
++  const inactiveDevices = jest
++    .fn()
++    .mockResolvedValue({ count: 0, devices: [] });
+   const controller = new DeviceController(
+     { checkInactivity } as unknown as DeviceService,
+     { resolve } as unknown as ScopeService,
++    { inactiveDevices } as unknown as InactiveDevicesService,
+   );
+   const mockReq = {
+     user: { sub: 1, role: 'Colbits administrator' },
+@@ -53,4 +58,56 @@ describe('DeviceController', () => {
+     ).rejects.toThrow(BadRequestException);
+     expect(checkInactivity).not.toHaveBeenCalled();
+   });
+-});
+\ No newline at end of file
++});
++
++describe('DeviceController.getInactiveDevices (US17 · F-40)', () => {
++  const resolve = jest
++    .fn()
++    .mockResolvedValue({ kind: 'restricted', userId: 2 });
++  const inactiveDevices = jest
++    .fn()
++    .mockResolvedValue({ count: 0, devices: [] });
++  const controller = new DeviceController(
++    {} as unknown as DeviceService,
++    { resolve } as unknown as ScopeService,
++    { inactiveDevices } as unknown as InactiveDevicesService,
++  );
++  const request = { user: { sub: 2 } } as unknown as Request;
++
++  beforeEach(() => jest.clearAllMocks());
++
++  it('uses the scope of the user in the token and a 24 h window by default', async () => {
++    await controller.getInactiveDevices(undefined, request);
++
++    expect(resolve).toHaveBeenCalledWith(2);
++    expect(inactiveDevices).toHaveBeenCalledWith(
++      { kind: 'restricted', userId: 2 },
++      24,
++    );
++  });
++
++  it('passes a valid window in hours', async () => {
++    await controller.getInactiveDevices('1', request);
++
++    expect(inactiveDevices).toHaveBeenCalledWith(expect.anything(), 1);
++  });
++
++  it.each(['0', '-3', 'abc', '721'])(
++    'rejects hours=%s before querying',
++    async (hours) => {
++      await expect(
++        controller.getInactiveDevices(hours, request),
++      ).rejects.toThrow(BadRequestException);
++      expect(inactiveDevices).not.toHaveBeenCalled();
++    },
++  );
++
++  it('rejects a request without a valid user', async () => {
++    await expect(
++      controller.getInactiveDevices(undefined, {
++        user: { sub: '2' },
++      } as unknown as Request),
++    ).rejects.toThrow(UnauthorizedException);
++    expect(resolve).not.toHaveBeenCalled();
++  });
++});
+diff --git a/backend/src/device/device.controller.ts b/backend/src/device/device.controller.ts
+index 6e6f994..d121a21 100644
+--- a/backend/src/device/device.controller.ts
++++ b/backend/src/device/device.controller.ts
+@@ -21,8 +21,14 @@ import {
+ import { AuthGuard } from '../auth/auth.guard';
+ import { ErrorResponseDto } from '../common/dto/error-response.dto';
+ import { ScopeService } from '../scope/scope.service';
++import { InactiveDevicesResponseDto } from './dto/inactive-devices.dto';
+ import { InactivityResultDto } from './dto/inactivity-result.dto';
+ import { DeviceService } from './device.service';
++import {
++  DEFAULT_WINDOW_HOURS,
++  InactiveDevicesService,
++  MAX_WINDOW_HOURS,
++} from './inactive-devices.service';
+ 
+ @Controller('device')
+ @UseGuards(AuthGuard)
+@@ -32,8 +38,42 @@ export class DeviceController {
+   constructor(
+     private readonly deviceService: DeviceService,
+     private readonly scopeService: ScopeService,
++    private readonly inactiveDevicesService: InactiveDevicesService,
+   ) {}
+ 
++  @Get('inactive')
++  @ApiOperation({
++    summary:
++      'Inactive devices of the user scope with their inactivity alarms (US17: F-38, F-39, F-40, F-46; NF-07, NF-08).',
++    description:
++      'A device is inactive when its next record comes more than its threshold after the previous one (FALCON_INACTIVITY_HOURS 9, SMAC_INACTIVITY_HOURS 3), or when it has not reported for longer than that. Each such silence is an inactivity alarm: it opens at "previous record + threshold" (F-38) and resolves by itself at the next stored record (F-39); end is null while it is open. Lists the devices of the user scope inactive at any moment of the last `hours` (or that never reported): inactive now first, oldest last record first (F-40), then the ones that reported again, most recently resolved first. low_energy flags an energy level below FALCON_LOW_ENERGY_PERCENT / SMAC_LOW_ENERGY_PERCENT (30 % by default, NF-08), which can explain the silence.',
++  })
++  @ApiQuery({
++    name: 'hours',
++    required: false,
++    type: Number,
++    example: DEFAULT_WINDOW_HOURS,
++    description: `Window in hours up to now (default ${DEFAULT_WINDOW_HOURS}, at most ${MAX_WINDOW_HOURS}).`,
++  })
++  @ApiOkResponse({ type: InactiveDevicesResponseDto })
++  @ApiBadRequestResponse({
++    type: ErrorResponseDto,
++    description: `hours must be a number greater than 0 and at most ${MAX_WINDOW_HOURS}.`,
++  })
++  @ApiUnauthorizedResponse({
++    type: ErrorResponseDto,
++    description: 'Bearer token is missing, invalid, or expired.',
++  })
++  async getInactiveDevices(
++    @Query('hours') hours: string | undefined,
++    @Req() request: Request,
++  ) {
++    const windowHours = parseWindowHours(hours);
++    const scope = await this.scopeService.resolve(userIdOf(request));
++
++    return this.inactiveDevicesService.inactiveDevices(scope, windowHours);
++  }
++
+   @Get('inactivity-status')
+   @ApiOperation({
+     summary:
+@@ -99,4 +139,30 @@ export class DeviceController {
+ 
+     return this.deviceService.checkInactivity(deviceId.trim(), type, scope);
+   }
+-}
+\ No newline at end of file
++}
++
++/** Window of GET /device/inactive: the default when absent, otherwise a number in (0, MAX_WINDOW_HOURS]. */
++function parseWindowHours(raw: string | undefined): number {
++  if (raw === undefined || raw.trim() === '') return DEFAULT_WINDOW_HOURS;
++  const hours = Number(raw);
++  if (!Number.isFinite(hours) || hours <= 0 || hours > MAX_WINDOW_HOURS) {
++    throw new BadRequestException(
++      `hours must be a number greater than 0 and at most ${MAX_WINDOW_HOURS}`,
++    );
++  }
++  return hours;
++}
++
++/** User id from the verified token, or 401 (the guard already checked the signature). */
++function userIdOf(request: Request): number {
++  const userId: unknown = (request as Request & { user?: { sub?: unknown } })
++    .user?.sub;
++  if (
++    typeof userId !== 'number' ||
++    !Number.isSafeInteger(userId) ||
++    userId <= 0
++  ) {
++    throw new UnauthorizedException('Invalid user identity');
++  }
++  return userId;
++}
+diff --git a/backend/src/device/device.module.ts b/backend/src/device/device.module.ts
+index 25e0e16..a485eb4 100644
+--- a/backend/src/device/device.module.ts
++++ b/backend/src/device/device.module.ts
+@@ -8,6 +8,7 @@ import { Node } from '../nodes/node.entity';
+ import { ScopeModule } from '../scope/scope.module';
+ import { DeviceController } from './device.controller';
+ import { DeviceService } from './device.service';
++import { InactiveDevicesService } from './inactive-devices.service';
+ 
+ @Module({
+   imports: [
+@@ -24,6 +25,6 @@ import { DeviceService } from './device.service';
+     AuthModule,
+   ],
+   controllers: [DeviceController],
+-  providers: [DeviceService],
++  providers: [DeviceService, InactiveDevicesService],
+ })
+-export class DeviceModule {}
+\ No newline at end of file
++export class DeviceModule {}
+diff --git a/backend/src/device/dto/inactive-devices.dto.ts b/backend/src/device/dto/inactive-devices.dto.ts
+new file mode 100644
+index 0000000..bb18d79
+--- /dev/null
++++ b/backend/src/device/dto/inactive-devices.dto.ts
+@@ -0,0 +1,147 @@
++import { ApiProperty } from '@nestjs/swagger';
++
++export class InactivityPeriodDto {
++  @ApiProperty({
++    format: 'date-time',
++    example: '2026-11-11T09:00:00.000Z',
++    description:
++      'Moment the device was declared inactive: its previous record plus the threshold (F-38: the inactivity alarm opens).',
++  })
++  start: string;
++
++  @ApiProperty({
++    type: String,
++    format: 'date-time',
++    nullable: true,
++    example: null,
++    description:
++      'Timestamp of the record that ended the silence (F-39: the alarm resolves by itself). Null while the device is still silent.',
++  })
++  end: string | null;
++}
++
++export class LocationRefDto {
++  @ApiProperty({ example: 1 })
++  id: number;
++
++  @ApiProperty({ example: 'North Ring 01' })
++  name: string;
++}
++
++export class SubstationRefDto extends LocationRefDto {
++  @ApiProperty({ example: 'SUB-N-001' })
++  code: string;
++}
++
++export class InactiveDeviceDto {
++  @ApiProperty({
++    example: '1301000004',
++    description: 'Device hardware id (hw_id).',
++  })
++  hw_id: string;
++
++  @ApiProperty({
++    example: '0000100002-A-R',
++    description:
++      'Stable id of what the device monitors: fuse or transformer custom_id.',
++  })
++  source_id: string;
++
++  @ApiProperty({ enum: ['FALCON', 'SMAC'], example: 'FALCON' })
++  kind: 'FALCON' | 'SMAC';
++
++  @ApiProperty({ example: '0000100002', description: 'Node identifier.' })
++  node: string;
++
++  @ApiProperty({ type: () => LocationRefDto })
++  zone: LocationRefDto;
++
++  @ApiProperty({ type: () => SubstationRefDto })
++  substation: SubstationRefDto;
++
++  @ApiProperty({ type: () => LocationRefDto })
++  circuit: LocationRefDto;
++
++  @ApiProperty({
++    example: 9,
++    description:
++      'Hours without records after which this device is inactive (FALCON_INACTIVITY_HOURS / SMAC_INACTIVITY_HOURS).',
++  })
++  threshold_hours: number;
++
++  @ApiProperty({
++    type: String,
++    format: 'date-time',
++    nullable: true,
++    example: '2026-11-11T00:00:00.000Z',
++    description:
++      'Stored timestamp of its latest record (F-46); null if it never reported.',
++  })
++  last_record_at: string | null;
++
++  @ApiProperty({
++    example: true,
++    description:
++      'Silent for more than its threshold now, or never reported (F-36, F-37). Equals having an open period, except for a device that never reported, which has none.',
++  })
++  inactive_now: boolean;
++
++  @ApiProperty({
++    type: Number,
++    nullable: true,
++    example: 12,
++    description:
++      'Latest energy level in %: supercapacitors (Falcon) or battery (SMAC). Null without a reading.',
++  })
++  energy_percent: number | null;
++
++  @ApiProperty({
++    type: Boolean,
++    nullable: true,
++    example: true,
++    description:
++      'energy_percent below the low-energy threshold (NF-08: FALCON_LOW_ENERGY_PERCENT / SMAC_LOW_ENERGY_PERCENT, 30 by default). It can explain why the device went silent. Null without a reading.',
++  })
++  low_energy: boolean | null;
++
++  @ApiProperty({
++    type: () => [InactivityPeriodDto],
++    description:
++      'Its inactivity alarms that touch the window, oldest first. Full periods, not cut to the window.',
++  })
++  periods: InactivityPeriodDto[];
++}
++
++export class InactiveDevicesThresholdsDto {
++  @ApiProperty({ example: 9 }) falcon_inactivity_hours: number;
++  @ApiProperty({ example: 3 }) smac_inactivity_hours: number;
++  @ApiProperty({ example: 30 }) falcon_low_energy_percent: number;
++  @ApiProperty({ example: 30 }) smac_low_energy_percent: number;
++}
++
++export class InactiveDevicesResponseDto {
++  @ApiProperty({
++    format: 'date-time',
++    description: 'Start of the window (now − hours).',
++  })
++  from: string;
++
++  @ApiProperty({
++    format: 'date-time',
++    description: 'End of the window: the moment of the request.',
++  })
++  to: string;
++
++  @ApiProperty({ type: () => InactiveDevicesThresholdsDto })
++  thresholds: InactiveDevicesThresholdsDto;
++
++  @ApiProperty({ example: 2, description: 'Number of devices returned.' })
++  count: number;
++
++  @ApiProperty({
++    type: () => [InactiveDeviceDto],
++    description:
++      'Devices in the user scope that were inactive at some moment of the window (or never reported). F-40 order: inactive now first, oldest last record first; then the ones that reported again, most recently resolved first.',
++  })
++  devices: InactiveDeviceDto[];
++}
+diff --git a/backend/src/device/inactive-devices.service.spec.ts b/backend/src/device/inactive-devices.service.spec.ts
+new file mode 100644
+index 0000000..aec4917
+--- /dev/null
++++ b/backend/src/device/inactive-devices.service.spec.ts
+@@ -0,0 +1,186 @@
++import { ConfigService } from '@nestjs/config';
++import { Repository } from 'typeorm';
++import { Node } from '../nodes/node.entity';
++import { ScopeContext } from '../scope/scope.types';
++import {
++  INACTIVE_DEVICES_SQL,
++  InactiveDevicesService,
++} from './inactive-devices.service';
++
++const NOW = new Date('2026-11-12T00:00:00Z');
++
++const row = (overrides: Record<string, unknown> = {}) => ({
++  kind: 'FALCON',
++  hw_id: '1301000004',
++  source_id: '0000100002-A-R',
++  node_id: '0000100002',
++  zone_id: '1',
++  zone_name: 'North Ring 01',
++  substation_id: 2,
++  substation_code: 'SUB-N-002',
++  substation_name: 'S/E NORTE 2',
++  circuit_id: '1',
++  circuit_name: 'CTO 1',
++  last_at: '2026-11-11T12:00:00Z',
++  energy: '12',
++  gaps: [{ from: '2026-11-11T12:00:00Z', next: null }],
++  ...overrides,
++});
++
++function serviceWith(
++  nodes: string[],
++  rows: unknown[],
++  env: Record<string, string | undefined> = {},
++) {
++  const builder = {
++    select: jest.fn().mockReturnThis(),
++    andWhere: jest.fn().mockReturnThis(),
++    setParameter: jest.fn().mockReturnThis(),
++    getMany: jest.fn().mockResolvedValue(nodes.map((name) => ({ name }))),
++  };
++  const repository = {
++    createQueryBuilder: jest.fn().mockReturnValue(builder),
++    query: jest.fn().mockResolvedValue(rows),
++  };
++  const config = { get: jest.fn((key: string) => env[key]) };
++  const service = new InactiveDevicesService(
++    repository as unknown as Repository<Node>,
++    config as unknown as ConfigService,
++  );
++  return { service, repository, builder };
++}
++
++const UNRESTRICTED: ScopeContext = { kind: 'unrestricted' };
++
++describe('InactiveDevicesService (US17 · F-38, F-39, F-40, NF-08)', () => {
++  it('returns each inactive device with its location, energy and open alarm', async () => {
++    const { service, repository } = serviceWith(['0000100002'], [row()]);
++
++    const result = await service.inactiveDevices(UNRESTRICTED, 24, NOW);
++
++    expect(result).toEqual({
++      from: '2026-11-11T00:00:00.000Z',
++      to: '2026-11-12T00:00:00.000Z',
++      thresholds: {
++        falcon_inactivity_hours: 9,
++        smac_inactivity_hours: 3,
++        falcon_low_energy_percent: 30,
++        smac_low_energy_percent: 30,
++      },
++      count: 1,
++      devices: [
++        {
++          hw_id: '1301000004',
++          source_id: '0000100002-A-R',
++          kind: 'FALCON',
++          node: '0000100002',
++          zone: { id: 1, name: 'North Ring 01' },
++          substation: { id: 2, code: 'SUB-N-002', name: 'S/E NORTE 2' },
++          circuit: { id: 1, name: 'CTO 1' },
++          threshold_hours: 9,
++          last_record_at: '2026-11-11T12:00:00.000Z',
++          inactive_now: true,
++          energy_percent: 12,
++          low_energy: true,
++          periods: [{ start: '2026-11-11T21:00:00.000Z', end: null }],
++        },
++      ],
++    });
++    expect(repository.query).toHaveBeenCalledWith(INACTIVE_DEVICES_SQL, [
++      ['0000100002'],
++      '2026-11-11T00:00:00.000Z',
++      '2026-11-12T00:00:00.000Z',
++      9,
++      3,
++    ]);
++  });
++
++  it('applies the user scope in SQL and reads nothing for a user without nodes (F-10)', async () => {
++    const { service, repository, builder } = serviceWith([], []);
++
++    const result = await service.inactiveDevices(
++      { kind: 'restricted', userId: 2 },
++      24,
++      NOW,
++    );
++
++    expect(builder.andWhere).toHaveBeenCalledWith(
++      expect.stringContaining('user_scopes'),
++    );
++    expect(repository.query).not.toHaveBeenCalled();
++    expect(result.devices).toEqual([]);
++  });
++
++  it('uses the configured inactivity and low-energy thresholds (NF-07, NF-08)', async () => {
++    const { service, repository } = serviceWith(
++      ['0000100005'],
++      [
++        row({
++          kind: 'SMAC',
++          hw_id: '0501000002',
++          source_id: '0000100005-T1-2',
++          energy: 35,
++          last_at: '2026-11-11T22:00:00Z',
++          gaps: JSON.stringify([{ from: '2026-11-11T22:00:00Z', next: null }]),
++        }),
++      ],
++      { SMAC_INACTIVITY_HOURS: '1', SMAC_LOW_ENERGY_PERCENT: '40' },
++    );
++
++    const [device] = (await service.inactiveDevices(UNRESTRICTED, 24, NOW))
++      .devices;
++
++    expect(device.threshold_hours).toBe(1);
++    expect(device.low_energy).toBe(true);
++    expect(device.periods).toEqual([
++      { start: '2026-11-11T23:00:00.000Z', end: null },
++    ]);
++    expect(repository.query).toHaveBeenCalledWith(
++      INACTIVE_DEVICES_SQL,
++      expect.arrayContaining([9, 1]),
++    );
++  });
++
++  it('keeps a device that reported again, with its resolved alarm, and drops always-active ones', async () => {
++    const { service } = serviceWith(
++      ['0000100002', '0000100003'],
++      [
++        row({
++          hw_id: 'BACK',
++          last_at: '2026-11-11T23:50:00Z',
++          gaps: [
++            { from: '2026-11-11T00:00:00Z', next: '2026-11-11T20:00:00Z' },
++          ],
++        }),
++        row({ hw_id: 'ACTIVE', last_at: '2026-11-11T23:50:00Z', gaps: [] }),
++      ],
++    );
++
++    const { devices } = await service.inactiveDevices(UNRESTRICTED, 24, NOW);
++
++    expect(devices.map((d) => d.hw_id)).toEqual(['BACK']);
++    expect(devices[0].inactive_now).toBe(false);
++    expect(devices[0].periods).toEqual([
++      { start: '2026-11-11T09:00:00.000Z', end: '2026-11-11T20:00:00.000Z' },
++    ]);
++  });
++
++  it('lists a device that never reported as inactive, with no period and no energy', async () => {
++    const { service } = serviceWith(
++      ['0000100002'],
++      [row({ hw_id: 'NEVER', last_at: null, energy: null, gaps: [] })],
++    );
++
++    const [device] = (await service.inactiveDevices(UNRESTRICTED, 24, NOW))
++      .devices;
++
++    expect(device).toMatchObject({
++      hw_id: 'NEVER',
++      inactive_now: true,
++      last_record_at: null,
++      energy_percent: null,
++      low_energy: null,
++      periods: [],
++    });
++  });
++});
+diff --git a/backend/src/device/inactive-devices.service.ts b/backend/src/device/inactive-devices.service.ts
+new file mode 100644
+index 0000000..ddaddaf
+--- /dev/null
++++ b/backend/src/device/inactive-devices.service.ts
+@@ -0,0 +1,267 @@
++import { Injectable } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import { InjectRepository } from '@nestjs/typeorm';
++import { Repository } from 'typeorm';
++import { Node } from '../nodes/node.entity';
++import { applyNodeScope } from '../scope/scope-query.helper';
++import { ScopeContext } from '../scope/scope.types';
++import {
++  InactiveDeviceDto,
++  InactiveDevicesResponseDto,
++} from './dto/inactive-devices.dto';
++import {
++  RecordGap,
++  compareInactiveDevices,
++  inactivityPeriods,
++  isInactiveNow,
++} from './inactivity-periods';
++import {
++  DeviceKind,
++  LOW_ENERGY_SETTINGS,
++  isLowEnergy,
++  lowEnergyThreshold,
++} from './low-energy';
++
++/** Default window of the list (the panel offers "last hour" and "last day") and its upper limit. */
++export const DEFAULT_WINDOW_HOURS = 24;
++export const MAX_WINDOW_HOURS = 30 * 24;
++
++/**
++ * One row per device installed on the in-scope nodes ($1), with its location, latest record, latest
++ * energy level and the gaps between consecutive records that are longer than its threshold.
++ * Records are read inside the window [$2, $3] plus the last one before it, so a silence that began
++ * before the window is still seen. A SMAC record is a record in any of its three tables (TD-07).
++ * $4 / $5: Falcon / SMAC thresholds in hours. Every time is a stored timestamp (F-46).
++ */
++export const INACTIVE_DEVICES_SQL = `
++  WITH dev AS (
++    SELECT 'FALCON'::text AS kind, f.current_hw_id AS hw_id, f.custom_id AS source_id, fs.node_id
++    FROM public.fuses f
++    JOIN public.fuses_sets fs ON fs.id = f.fuses_set_id
++    WHERE fs.node_id = ANY($1) AND f.current_hw_id IS NOT NULL
++    UNION ALL
++    SELECT 'SMAC'::text, t.current_hw_id, t.custom_id, t.node_id
++    FROM public.trafos t
++    WHERE t.node_id = ANY($1) AND t.current_hw_id IS NOT NULL
++  ),
++  rec AS (
++    SELECT d.hw_id, r.recorded_at
++    FROM dev d
++    CROSS JOIN LATERAL (
++      SELECT v.recorded_at FROM public.falcon_values v
++       WHERE d.kind = 'FALCON' AND v.hw_id = d.hw_id
++         AND v.recorded_at >= $2::timestamptz AND v.recorded_at <= $3::timestamptz
++      UNION
++      SELECT v.recorded_at FROM public.smac_vc_values v
++       WHERE d.kind = 'SMAC' AND v.hw_id = d.hw_id
++         AND v.recorded_at >= $2::timestamptz AND v.recorded_at <= $3::timestamptz
++      UNION
++      SELECT v.recorded_at FROM public.smac_pw_values v
++       WHERE d.kind = 'SMAC' AND v.hw_id = d.hw_id
++         AND v.recorded_at >= $2::timestamptz AND v.recorded_at <= $3::timestamptz
++      UNION
++      SELECT v.recorded_at FROM public.smac_pf_values v
++       WHERE d.kind = 'SMAC' AND v.hw_id = d.hw_id
++         AND v.recorded_at >= $2::timestamptz AND v.recorded_at <= $3::timestamptz
++      UNION
++      SELECT b.recorded_at FROM (
++        SELECT CASE WHEN d.kind = 'FALCON' THEN
++                 (SELECT max(recorded_at) FROM public.falcon_values
++                   WHERE hw_id = d.hw_id AND recorded_at < $2::timestamptz)
++               ELSE GREATEST(
++                 (SELECT max(recorded_at) FROM public.smac_vc_values
++                   WHERE hw_id = d.hw_id AND recorded_at < $2::timestamptz),
++                 (SELECT max(recorded_at) FROM public.smac_pw_values
++                   WHERE hw_id = d.hw_id AND recorded_at < $2::timestamptz),
++                 (SELECT max(recorded_at) FROM public.smac_pf_values
++                   WHERE hw_id = d.hw_id AND recorded_at < $2::timestamptz))
++               END AS recorded_at
++      ) b WHERE b.recorded_at IS NOT NULL
++    ) r
++  ),
++  gaps AS (
++    SELECT hw_id, recorded_at AS from_at,
++           LEAD(recorded_at) OVER (PARTITION BY hw_id ORDER BY recorded_at) AS next_at
++    FROM rec
++  )
++  SELECT d.kind, d.hw_id, d.source_id, d.node_id,
++         z.id AS zone_id, z.name AS zone_name,
++         s.id AS substation_id, s.code AS substation_code, s.name AS substation_name,
++         c.id AS circuit_id, c.name AS circuit_name,
++         l.last_at, l.energy,
++         COALESCE(
++           json_agg(json_build_object('from', g.from_at, 'next', g.next_at) ORDER BY g.from_at)
++             FILTER (WHERE g.hw_id IS NOT NULL),
++           '[]'
++         ) AS gaps
++  FROM dev d
++  JOIN public.nodes n ON n.name = d.node_id
++  JOIN public.circuits c ON c.id = n.circuit_id
++  JOIN public.substations s ON s.id = c.substation_id
++  JOIN public.zones z ON z.id = s.zone_id
++  CROSS JOIN LATERAL (
++    SELECT CASE WHEN d.kind = 'FALCON' THEN
++             (SELECT recorded_at FROM public.last_falcon_values WHERE hw_id = d.hw_id)
++           ELSE GREATEST(
++             (SELECT recorded_at FROM public.last_smac_vc_values WHERE hw_id = d.hw_id),
++             (SELECT recorded_at FROM public.last_smac_pw_values WHERE hw_id = d.hw_id),
++             (SELECT recorded_at FROM public.last_smac_pf_values WHERE hw_id = d.hw_id))
++           END AS last_at,
++           CASE WHEN d.kind = 'FALCON' THEN
++             (SELECT supercaps_per FROM public.last_falcon_values WHERE hw_id = d.hw_id)
++           ELSE
++             (SELECT battery_per FROM public.last_smac_vc_values WHERE hw_id = d.hw_id)
++           END AS energy
++  ) l
++  LEFT JOIN gaps g
++    ON g.hw_id = d.hw_id
++   AND COALESCE(g.next_at, $3::timestamptz) - g.from_at
++       > (CASE d.kind WHEN 'FALCON' THEN $4::float8 ELSE $5::float8 END) * interval '1 hour'
++  GROUP BY d.kind, d.hw_id, d.source_id, d.node_id, z.id, z.name, s.id, s.code, s.name,
++           c.id, c.name, l.last_at, l.energy
++`;
++
++interface InactiveDeviceRow {
++  kind: DeviceKind;
++  hw_id: string;
++  source_id: string;
++  node_id: string;
++  zone_id: number | string;
++  zone_name: string;
++  substation_id: number | string;
++  substation_code: string;
++  substation_name: string;
++  circuit_id: number | string;
++  circuit_name: string;
++  last_at: Date | string | null;
++  energy: number | string | null;
++  gaps: { from: string; next: string | null }[] | string;
++}
++
++/** US17 · F-38, F-39, F-40 (+ NF-08): inactive devices of the user scope with their inactivity alarms. */
++@Injectable()
++export class InactiveDevicesService {
++  constructor(
++    @InjectRepository(Node)
++    private readonly nodesRepository: Repository<Node>,
++    private readonly configService: ConfigService,
++  ) {}
++
++  async inactiveDevices(
++    scope: ScopeContext,
++    windowHours: number = DEFAULT_WINDOW_HOURS,
++    now: Date = new Date(),
++  ): Promise<InactiveDevicesResponseDto> {
++    const from = new Date(now.getTime() - windowHours * 3_600_000);
++    const thresholds = {
++      falcon_inactivity_hours: this.hours('FALCON_INACTIVITY_HOURS', 9),
++      smac_inactivity_hours: this.hours('SMAC_INACTIVITY_HOURS', 3),
++      falcon_low_energy_percent: lowEnergyThreshold(
++        this.configService.get(LOW_ENERGY_SETTINGS.FALCON),
++      ),
++      smac_low_energy_percent: lowEnergyThreshold(
++        this.configService.get(LOW_ENERGY_SETTINGS.SMAC),
++      ),
++    };
++    const envelope = {
++      from: from.toISOString(),
++      to: now.toISOString(),
++      thresholds,
++    };
++
++    // Scope in SQL, as every other endpoint (F-10): only the user's nodes are read.
++    const nodesQuery = this.nodesRepository
++      .createQueryBuilder('node')
++      .select(['node.name']);
++    applyNodeScope(nodesQuery, 'node.name', scope);
++    const nodeNames = (await nodesQuery.getMany()).map((node) => node.name);
++    if (nodeNames.length === 0) return { ...envelope, count: 0, devices: [] };
++
++    const rows: InactiveDeviceRow[] = await this.nodesRepository.query(
++      INACTIVE_DEVICES_SQL,
++      [
++        nodeNames,
++        from.toISOString(),
++        now.toISOString(),
++        thresholds.falcon_inactivity_hours,
++        thresholds.smac_inactivity_hours,
++      ],
++    );
++
++    const devices = rows
++      .map((row) => toDevice(row, thresholds, from, now))
++      .filter((device) => device.periods.length > 0 || device.inactive_now)
++      .sort((a, b) => compareInactiveDevices(orderKey(a), orderKey(b)));
++
++    return { ...envelope, count: devices.length, devices };
++  }
++
++  /** Same rule as the other services: a positive number of hours from the config, or the default. */
++  private hours(key: string, fallback: number): number {
++    const configured = Number(this.configService.get(key));
++    return Number.isFinite(configured) && configured > 0
++      ? configured
++      : fallback;
++  }
++}
++
++function toDevice(
++  row: InactiveDeviceRow,
++  thresholds: InactiveDevicesResponseDto['thresholds'],
++  from: Date,
++  now: Date,
++): InactiveDeviceDto {
++  const falcon = row.kind === 'FALCON';
++  const thresholdHours = falcon
++    ? thresholds.falcon_inactivity_hours
++    : thresholds.smac_inactivity_hours;
++  const lastRecordAt = row.last_at === null ? null : new Date(row.last_at);
++  const rawGaps =
++    typeof row.gaps === 'string' ? JSON.parse(row.gaps) : row.gaps;
++  const gaps: RecordGap[] = (
++    rawGaps as { from: string; next: string | null }[]
++  ).map((gap) => ({
++    from: new Date(gap.from),
++    next: gap.next === null ? null : new Date(gap.next),
++  }));
++  const energy = row.energy === null ? null : Number(row.energy);
++
++  return {
++    hw_id: row.hw_id,
++    source_id: row.source_id,
++    kind: row.kind,
++    node: row.node_id,
++    zone: { id: Number(row.zone_id), name: row.zone_name },
++    substation: {
++      id: Number(row.substation_id),
++      code: row.substation_code,
++      name: row.substation_name,
++    },
++    circuit: { id: Number(row.circuit_id), name: row.circuit_name },
++    threshold_hours: thresholdHours,
++    last_record_at: lastRecordAt?.toISOString() ?? null,
++    inactive_now: isInactiveNow(lastRecordAt, thresholdHours, now),
++    energy_percent: energy,
++    low_energy: isLowEnergy(
++      energy,
++      falcon
++        ? thresholds.falcon_low_energy_percent
++        : thresholds.smac_low_energy_percent,
++    ),
++    periods: inactivityPeriods(gaps, thresholdHours, from, now).map((p) => ({
++      start: p.start.toISOString(),
++      end: p.end?.toISOString() ?? null,
++    })),
++  };
++}
++
++const orderKey = (device: InactiveDeviceDto) => ({
++  hwId: device.hw_id,
++  inactiveNow: device.inactive_now,
++  lastRecordAt:
++    device.last_record_at === null ? null : new Date(device.last_record_at),
++  periods: device.periods.map((p) => ({
++    start: new Date(p.start),
++    end: p.end === null ? null : new Date(p.end),
++  })),
++});
+diff --git a/backend/src/device/inactivity-periods.spec.ts b/backend/src/device/inactivity-periods.spec.ts
+new file mode 100644
+index 0000000..afb69ce
+--- /dev/null
++++ b/backend/src/device/inactivity-periods.spec.ts
+@@ -0,0 +1,158 @@
++import {
++  compareInactiveDevices,
++  inactivityPeriods,
++  isInactiveNow,
++} from './inactivity-periods';
++
++const at = (iso: string) => new Date(iso);
++const H = 3_600_000;
++const NOW = at('2026-11-12T00:00:00Z');
++const DAY_AGO = new Date(NOW.getTime() - 24 * H);
++
++describe('inactivityPeriods (US17 · F-38, F-39, F-42)', () => {
++  it('F-42 example: records at 00:00 and 20:00 give one period from 09:00 to 20:00', () => {
++    const periods = inactivityPeriods(
++      [
++        { from: at('2026-11-11T00:00:00Z'), next: at('2026-11-11T20:00:00Z') },
++        { from: at('2026-11-11T20:00:00Z'), next: at('2026-11-11T20:15:00Z') },
++      ],
++      9,
++      DAY_AGO,
++      NOW,
++    );
++
++    expect(periods).toEqual([
++      { start: at('2026-11-11T09:00:00Z'), end: at('2026-11-11T20:00:00Z') },
++    ]);
++  });
++
++  it('F-38: a device silent for longer than its threshold has an open alarm', () => {
++    const periods = inactivityPeriods(
++      [{ from: at('2026-11-11T12:00:00Z'), next: null }],
++      9,
++      DAY_AGO,
++      NOW,
++    );
++
++    expect(periods).toEqual([{ start: at('2026-11-11T21:00:00Z'), end: null }]);
++  });
++
++  it('F-39: the alarm resolves with the timestamp of the record that ends the silence', () => {
++    const [period] = inactivityPeriods(
++      [{ from: at('2026-11-11T12:00:00Z'), next: at('2026-11-11T23:30:00Z') }],
++      9,
++      DAY_AGO,
++      NOW,
++    );
++
++    expect(period.end).toEqual(at('2026-11-11T23:30:00Z'));
++  });
++
++  it('F-36 / F-37 boundary: a gap exactly equal to the threshold is not inactivity', () => {
++    expect(
++      inactivityPeriods(
++        [
++          {
++            from: at('2026-11-11T12:00:00Z'),
++            next: at('2026-11-11T15:00:00Z'),
++          },
++        ],
++        3,
++        DAY_AGO,
++        NOW,
++      ),
++    ).toEqual([]);
++    expect(
++      inactivityPeriods(
++        [
++          {
++            from: at('2026-11-11T12:00:00Z'),
++            next: at('2026-11-11T15:01:00Z'),
++          },
++        ],
++        3,
++        DAY_AGO,
++        NOW,
++      ),
++    ).toHaveLength(1);
++  });
++
++  it('a silent device that has not yet reached its threshold has no alarm', () => {
++    expect(
++      inactivityPeriods(
++        [{ from: at('2026-11-11T22:00:00Z'), next: null }],
++        3,
++        DAY_AGO,
++        NOW,
++      ),
++    ).toEqual([]);
++  });
++
++  it('keeps a period that started before the window and drops one that ended before it', () => {
++    const periods = inactivityPeriods(
++      [
++        { from: at('2026-11-09T00:00:00Z'), next: at('2026-11-10T00:00:00Z') },
++        { from: at('2026-11-10T06:00:00Z'), next: at('2026-11-11T06:00:00Z') },
++      ],
++      9,
++      DAY_AGO,
++      NOW,
++    );
++
++    expect(periods).toEqual([
++      { start: at('2026-11-10T15:00:00Z'), end: at('2026-11-11T06:00:00Z') },
++    ]);
++  });
++});
++
++describe('isInactiveNow (F-36, F-37)', () => {
++  it('is true without records or past the threshold', () => {
++    expect(isInactiveNow(null, 9, NOW)).toBe(true);
++    expect(isInactiveNow(at('2026-11-11T14:59:00Z'), 9, NOW)).toBe(true);
++    expect(isInactiveNow(at('2026-11-11T15:01:00Z'), 9, NOW)).toBe(false);
++  });
++});
++
++describe('compareInactiveDevices (F-40 order)', () => {
++  const key = (
++    hwId: string,
++    inactiveNow: boolean,
++    lastRecordAt: string | null,
++    lastEnd: string | null = null,
++  ) => ({
++    hwId,
++    inactiveNow,
++    lastRecordAt: lastRecordAt === null ? null : at(lastRecordAt),
++    periods: lastEnd ? [{ start: at(lastEnd), end: at(lastEnd) }] : [],
++  });
++
++  it('F-40 acceptance: last records 30, 12 and 4 hours old appear in that order', () => {
++    const devices = [
++      key('C', true, '2026-11-11T20:00:00Z'),
++      key('A', true, '2026-11-10T18:00:00Z'),
++      key('B', true, '2026-11-11T12:00:00Z'),
++    ];
++
++    expect(devices.sort(compareInactiveDevices).map((d) => d.hwId)).toEqual([
++      'A',
++      'B',
++      'C',
++    ]);
++  });
++
++  it('puts a device that never reported first, and devices that reported again last', () => {
++    const devices = [
++      key('back-old', false, '2026-11-11T23:00:00Z', '2026-11-11T10:00:00Z'),
++      key('silent', true, '2026-11-11T10:00:00Z'),
++      key('back-new', false, '2026-11-11T23:00:00Z', '2026-11-11T20:00:00Z'),
++      key('never', true, null),
++    ];
++
++    expect(devices.sort(compareInactiveDevices).map((d) => d.hwId)).toEqual([
++      'never',
++      'silent',
++      'back-new',
++      'back-old',
++    ]);
++  });
++});
+diff --git a/backend/src/device/inactivity-periods.ts b/backend/src/device/inactivity-periods.ts
+new file mode 100644
+index 0000000..3f8aec2
+--- /dev/null
++++ b/backend/src/device/inactivity-periods.ts
+@@ -0,0 +1,94 @@
++/**
++ * Inactivity periods and the inactivity alarm (US17 · F-38, F-39, F-40; Scope v6.0 §3.2, §3.3).
++ *
++ * Inactivity is derived from the absence of records; the device never reports it. A device whose
++ * next record comes more than its threshold after the previous one (or that has not reported for
++ * more than the threshold) was inactive from `previous record + threshold` (the moment it is
++ * declared inactive) until its next record. That period IS the device's inactivity alarm:
++ *   F-38  it opens when the device passes its threshold (open period, `end: null`);
++ *   F-39  it resolves by itself when the device stores a new record, with the end taken from that
++ *         record's stored timestamp (F-46), so nobody closes it by hand.
++ * Example from the F-42 acceptance test: Falcon records at 00:00 and 20:00, threshold 9 h →
++ * one period from 09:00 to 20:00.
++ */
++import type { DeviceKind } from './low-energy';
++
++const HOUR_MS = 3_600_000;
++
++/** Consecutive records of one device, as the SQL returns them: `next` is null for the last one. */
++export interface RecordGap {
++  from: Date;
++  next: Date | null;
++}
++
++export interface InactivityPeriod {
++  start: Date;
++  /** null while the device is still silent: the inactivity alarm is open. */
++  end: Date | null;
++}
++
++/**
++ * Inactivity periods of one device that touch the window [windowStart, now]. A gap counts only when
++ * it is longer than the threshold ("more than 9 hours", F-36 / F-37), never when it is equal.
++ */
++export function inactivityPeriods(
++  gaps: readonly RecordGap[],
++  thresholdHours: number,
++  windowStart: Date,
++  now: Date,
++): InactivityPeriod[] {
++  const threshold = thresholdHours * HOUR_MS;
++  return gaps
++    .filter(
++      (gap) => (gap.next ?? now).getTime() - gap.from.getTime() > threshold,
++    )
++    .map((gap) => ({
++      start: new Date(gap.from.getTime() + threshold),
++      end: gap.next,
++    }))
++    .filter((period) => (period.end ?? now).getTime() > windowStart.getTime())
++    .sort((a, b) => a.start.getTime() - b.start.getTime());
++}
++
++/** Inactive now (F-36 / F-37): no record at all, or the last one older than the threshold. */
++export function isInactiveNow(
++  lastRecordAt: Date | null,
++  thresholdHours: number,
++  now: Date,
++): boolean {
++  return (
++    lastRecordAt === null ||
++    now.getTime() - lastRecordAt.getTime() > thresholdHours * HOUR_MS
++  );
++}
++
++export interface InactiveDeviceOrderKey {
++  hwId: string;
++  inactiveNow: boolean;
++  lastRecordAt: Date | null;
++  periods: readonly InactivityPeriod[];
++}
++
++/**
++ * F-40 order: devices inactive now first, from the oldest last record to the most recent (a device
++ * that never reported comes first); then devices that already reported again, the most recently
++ * resolved first. Ties by hardware id, so the order is stable.
++ */
++export function compareInactiveDevices(
++  a: InactiveDeviceOrderKey,
++  b: InactiveDeviceOrderKey,
++): number {
++  if (a.inactiveNow !== b.inactiveNow) return a.inactiveNow ? -1 : 1;
++  const byTime = a.inactiveNow
++    ? timeOf(a.lastRecordAt) - timeOf(b.lastRecordAt)
++    : lastEnd(b) - lastEnd(a);
++  return byTime || a.hwId.localeCompare(b.hwId);
++}
++
++const timeOf = (date: Date | null): number =>
++  date === null ? Number.NEGATIVE_INFINITY : date.getTime();
++
++const lastEnd = (key: InactiveDeviceOrderKey): number =>
++  Math.max(...key.periods.map((p) => p.end?.getTime() ?? 0), 0);
++
++export type { DeviceKind };
+diff --git a/backend/src/device/low-energy.spec.ts b/backend/src/device/low-energy.spec.ts
+new file mode 100644
+index 0000000..ec9679d
+--- /dev/null
++++ b/backend/src/device/low-energy.spec.ts
+@@ -0,0 +1,36 @@
++import {
++  DEFAULT_LOW_ENERGY_PERCENT,
++  isLowEnergy,
++  lowEnergyThreshold,
++} from './low-energy';
++
++describe('low-energy thresholds (NF-08, CL-11)', () => {
++  it('defaults to the 30 % recommended by Colbits', () => {
++    expect(DEFAULT_LOW_ENERGY_PERCENT).toBe(30);
++    expect(lowEnergyThreshold(undefined)).toBe(30);
++  });
++
++  it('takes a configured percentage', () => {
++    expect(lowEnergyThreshold('45')).toBe(45);
++    expect(lowEnergyThreshold(12.5)).toBe(12.5);
++  });
++
++  it.each(['abc', '0', '-5', '101', ''])(
++    'falls back to the default for an invalid setting (%p)',
++    (value) => {
++      expect(lowEnergyThreshold(value)).toBe(30);
++    },
++  );
++
++  it('a level below the threshold is low; at or above it is not (F-44, F-45)', () => {
++    expect(isLowEnergy(29, 30)).toBe(true);
++    expect(isLowEnergy(30, 30)).toBe(false);
++    expect(isLowEnergy(80, 30)).toBe(false);
++    expect(isLowEnergy(null, 30)).toBeNull();
++  });
++
++  it('NF-08 acceptance: raising the threshold makes a reading between both values low', () => {
++    expect(isLowEnergy(35, lowEnergyThreshold(undefined))).toBe(false);
++    expect(isLowEnergy(35, lowEnergyThreshold('40'))).toBe(true);
++  });
++});
+diff --git a/backend/src/device/low-energy.ts b/backend/src/device/low-energy.ts
+new file mode 100644
+index 0000000..2130a7a
+--- /dev/null
++++ b/backend/src/device/low-energy.ts
+@@ -0,0 +1,32 @@
++/**
++ * Low device energy (NF-08, F-44, F-45; Scope v6.0 §3.2). Falcon devices keep energy in
++ * supercapacitors (`supercaps_per`) and SMAC devices in a battery (`battery_per`), both percentages
++ * (client answer CL-11). A level below the threshold is low; the client recommends 30 % for both.
++ * The thresholds are settings (NF-08), never hard-coded in the rules that use them.
++ */
++export type DeviceKind = 'FALCON' | 'SMAC';
++
++/** Recommended threshold (CL-11, Colbits, 3 Nov 2026), used when the setting is missing or invalid. */
++export const DEFAULT_LOW_ENERGY_PERCENT = 30;
++
++/** Setting that overrides the threshold of each device type (NF-08). */
++export const LOW_ENERGY_SETTINGS: Readonly<Record<DeviceKind, string>> = {
++  FALCON: 'FALCON_LOW_ENERGY_PERCENT',
++  SMAC: 'SMAC_LOW_ENERGY_PERCENT',
++};
++
++/** A configured percentage when it is a number in (0, 100]; otherwise the recommended default. */
++export function lowEnergyThreshold(configured: unknown): number {
++  const value = Number(configured);
++  return Number.isFinite(value) && value > 0 && value <= 100
++    ? value
++    : DEFAULT_LOW_ENERGY_PERCENT;
++}
++
++/** Whether a stored energy level is low ("falls below the threshold"); null when there is no level. */
++export function isLowEnergy(
++  level: number | null,
++  thresholdPercent: number,
++): boolean | null {
++  return level === null ? null : level < thresholdPercent;
++}
+diff --git a/backend/test/inactive-devices.e2e-spec.ts b/backend/test/inactive-devices.e2e-spec.ts
+new file mode 100644
+index 0000000..304cc1f
+--- /dev/null
++++ b/backend/test/inactive-devices.e2e-spec.ts
+@@ -0,0 +1,169 @@
++import { DataSource } from 'typeorm';
++import { InactiveDevicesService } from '../src/device/inactive-devices.service';
++import {
++  IsolatedApp,
++  createFalconNodes,
++  createSmacNodes,
++  removeFalconNodes,
++  removeSmacNodes,
++  startIsolatedApp,
++  stopIsolatedApp,
++} from './support/isolated-e2e';
++
++// US17 · F-38, F-39, F-40 (+ NF-08) against a real database: inactivity periods come from the
++// stored timestamps of falcon_values / smac_*_values, read through Colbits' triggers, and the list
++// only holds devices of the user's scope. Uses the isolated database and removes what it creates.
++
++const LABEL = 'US17';
++const IN_SCOPE_CIRCUIT = 1; // the seeded consultation user (id 2) sees circuit 1
++const OTHER_CIRCUIT = 4;
++
++/** Falcon nodes: hours ago of each reading (oldest first) and the supercapacitor level of the last one. */
++const FALCONS = [
++  { node: 'INAE2E0001', hw: '13E2EIN001', readings: [30], energy: 80 },
++  { node: 'INAE2E0002', hw: '13E2EIN002', readings: [12], energy: 80 },
++  { node: 'INAE2E0004', hw: '13E2EIN004', readings: [1], energy: 80 },
++  { node: 'INAE2E0005', hw: '13E2EIN005', readings: [22, 2], energy: 80 },
++  { node: 'INAE2E0006', hw: '13E2EIN006', readings: [10], energy: 10 },
++];
++const OUT_OF_SCOPE = {
++  node: 'INAE2E0007',
++  hw: '13E2EIN007',
++  readings: [20],
++  energy: 80,
++};
++const SMAC = { node: 'INAE2E0003', hw: '05E2EIN003' };
++
++const FALCON_NODES = [...FALCONS, OUT_OF_SCOPE].map((f) => f.node);
++const FALCON_HW = [...FALCONS, OUT_OF_SCOPE].map((f) => f.hw);
++const OURS = new Set([...FALCON_HW, SMAC.hw]);
++
++async function remove(dataSource: DataSource): Promise<void> {
++  await removeFalconNodes(dataSource, FALCON_NODES, FALCON_HW);
++  await removeSmacNodes(dataSource, [SMAC.node], [SMAC.hw]);
++}
++
++async function create(dataSource: DataSource): Promise<void> {
++  for (const [index, f] of [...FALCONS, OUT_OF_SCOPE].entries()) {
++    await createFalconNodes(
++      dataSource,
++      [
++        {
++          node: f.node,
++          fuseSetId: 990_100 + index,
++          fuses: [
++            { customId: `${f.node}-R`, phase: 'R', hwId: f.hw, reading: null },
++          ],
++        },
++      ],
++      f === OUT_OF_SCOPE ? OTHER_CIRCUIT : IN_SCOPE_CIRCUIT,
++    );
++    // In time order, so Colbits' trigger leaves the newest reading in last_falcon_values.
++    for (const hoursAgo of f.readings) {
++      await dataSource.query(
++        `INSERT INTO falcon_values (hw_id, custom_id, recorded_at, supercaps_per, fuse_state, is_voltage_present)
++         VALUES ($1, $2, now() - $3 * interval '1 hour', $4, 'Cerrado', true)`,
++        [f.hw, `${f.node}-R`, hoursAgo, f.energy],
++      );
++    }
++  }
++  await createSmacNodes(
++    dataSource,
++    [
++      {
++        node: SMAC.node,
++        transformers: [
++          {
++            customId: `${SMAC.node}-T1-3`,
++            hwId: SMAC.hw,
++            readings: [{ table: 'pf', hoursAgo: 4 }],
++          },
++        ],
++      },
++    ],
++    IN_SCOPE_CIRCUIT,
++  );
++}
++
++describe('US17 inactive devices and inactivity alarms (e2e)', () => {
++  let started: IsolatedApp | undefined;
++
++  beforeAll(async () => {
++    started = await startIsolatedApp(LABEL, { remove, create });
++  });
++
++  afterAll(() => stopIsolatedApp(started, LABEL, remove));
++
++  const list = async (userId?: number) => {
++    if (!started) throw new Error('app did not start');
++    const { devices } = await started.app
++      .get(InactiveDevicesService)
++      .inactiveDevices(
++        userId === undefined
++          ? { kind: 'unrestricted' }
++          : { kind: 'restricted', userId },
++        48,
++      );
++    return devices.filter((d) => OURS.has(d.hw_id));
++  };
++
++  it('F-40: inactive now first, oldest last record first, then the device that reported again', async () => {
++    expect((await list()).map((d) => d.node)).toEqual([
++      'INAE2E0001',
++      'INAE2E0007',
++      'INAE2E0002',
++      'INAE2E0006',
++      'INAE2E0003',
++      'INAE2E0005',
++    ]);
++  });
++
++  it('never lists a device that reported within its threshold', async () => {
++    expect((await list()).some((d) => d.node === 'INAE2E0004')).toBe(false);
++  });
++
++  it('F-40: a consultation user only sees the devices of their scope', async () => {
++    const nodes = (await list(2)).map((d) => d.node);
++    expect(nodes).not.toContain('INAE2E0007');
++    expect(nodes).toContain('INAE2E0001');
++  });
++
++  it('F-38: a silent device has an open inactivity alarm that starts at last record + threshold', async () => {
++    const device = (await list()).find((d) => d.node === 'INAE2E0002');
++    expect(device?.inactive_now).toBe(true);
++    expect(device?.periods).toHaveLength(1);
++    const [period] = device!.periods;
++    expect(period.end).toBeNull();
++    const start = new Date(period.start).getTime();
++    const expected =
++      new Date(device!.last_record_at!).getTime() + 9 * 3_600_000;
++    expect(start).toBe(expected);
++  });
++
++  it('F-39: the alarm of a device that reported again ends at that record', async () => {
++    const device = (await list()).find((d) => d.node === 'INAE2E0005');
++    expect(device?.inactive_now).toBe(false);
++    expect(device?.periods).toHaveLength(1);
++    expect(device!.periods[0].end).toBe(device!.last_record_at);
++  });
++
++  it('a SMAC counts as inactive after 3 h, whichever of its tables it last wrote', async () => {
++    const device = (await list()).find((d) => d.node === 'INAE2E0003');
++    expect(device).toMatchObject({
++      kind: 'SMAC',
++      threshold_hours: 3,
++      inactive_now: true,
++    });
++  });
++
++  it('NF-08: flags low energy against the 30 % default', async () => {
++    const devices = await list();
++    expect(devices.find((d) => d.node === 'INAE2E0006')).toMatchObject({
++      energy_percent: 10,
++      low_energy: true,
++    });
++    expect(devices.find((d) => d.node === 'INAE2E0002')?.low_energy).toBe(
++      false,
++    );
++  });
++});
+diff --git a/deploy/docker-compose.yml b/deploy/docker-compose.yml
+index eedaeda..641f2a5 100644
+--- a/deploy/docker-compose.yml
++++ b/deploy/docker-compose.yml
+@@ -40,6 +40,8 @@ services:
+       SMAC_INACTIVITY_HOURS: 3
+       # Test data older than this is regenerated, but only when the backend starts.
+       DATA_REFRESH_HOURS: 1
++      FALCON_LOW_ENERGY_PERCENT: 30
++      SMAC_LOW_ENERGY_PERCENT: 30
+     depends_on:
+       db:
+         condition: service_healthy
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 4d197fc..f253198 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -61,6 +61,8 @@ services:
+       # File events do not cross the Windows/macOS → Docker boundary; poll instead.
+       TSC_WATCHFILE: DynamicPriorityPolling
+       CHOKIDAR_USEPOLLING: 'true'
++      FALCON_LOW_ENERGY_PERCENT: ${FALCON_LOW_ENERGY_PERCENT:-30}
++      SMAC_LOW_ENERGY_PERCENT: ${SMAC_LOW_ENERGY_PERCENT:-30}
+     volumes:
+       - ./backend:/app
+       # Keep the container's Linux node_modules; never mix them with the host's.
+diff --git a/docs/bitacora-ia/2026-11-12-SCRUM-115.md b/docs/bitacora-ia/2026-11-12-SCRUM-115.md
+new file mode 100644
+index 0000000..b0c077a
+--- /dev/null
++++ b/docs/bitacora-ia/2026-11-12-SCRUM-115.md
+@@ -0,0 +1,26 @@
++# AI log — SCRUM-115 backend (US17 · F-38, F-39, F-40; NF-08) — 2026-11-12
++
++**Author:** Yeison Delgado · **Tool:** Claude (Claude Code)
++Covers SCRUM-232 (F-38), SCRUM-233 (F-39), SCRUM-234 (F-40) and SCRUM-244 (NF-08).
++
++## What the AI generated
++- `GET /device/inactive?hours=24` (`device.controller.ts`, `inactive-devices.service.ts`, Swagger DTO
++  `dto/inactive-devices.dto.ts`).
++- `inactivity-periods.ts`: the inactivity periods (the inactivity alarm) and the F-40 order.
++- `low-energy.ts`: the low-energy thresholds `FALCON_LOW_ENERGY_PERCENT` / `SMAC_LOW_ENERGY_PERCENT` (30 %).
++- Unit tests for the rules, the service and the controller, and the e2e test `test/inactive-devices.e2e-spec.ts`.
++- The new settings in `.env.example`, `docker-compose.yml`, `deploy/docker-compose.yml` and `render.yaml`.
++
++## What I did / reviewed
++- Rules from Requirements Specification v2.0: F-36/F-37 (more than 9 h / 3 h), F-38, F-39, F-40, the F-42
++  example (records at 00:00 and 20:00 → one period 09:00–20:00), F-46 (stored timestamps) and NF-08. The
++  30 % threshold comes from client answer CL-11 (`docs/decisions/client-clarifications-2026-11.md`).
++- Inactivity is derived from the absence of records (Scope §3.2), so the alarm is computed from the stored
++  timestamps, with no writes. It opens at "previous record + threshold" and resolves by itself at the next
++  record. A SMAC record is a record in any of its three tables (TD-07).
++- The response fits the frontend model of the Inactive devices tab (`inactiveDevices.types.ts`, SCRUM-235):
++  device, node, zone, substation, circuit, threshold and periods `{start, end|null}`.
++- The user scope is applied in SQL, like the other endpoints (F-10).
++- Ran: 510 unit tests, lint, build; e2e on PostgreSQL with Colbits' triggers (95 + 3, 7 new); a duplication
++  check (0 clones). With generator data, the real API listed the 3 silent devices and the inactivity scenarios
++  in F-40 order, and closed the alarm of a device that reported again at that record.
+diff --git a/render.yaml b/render.yaml
+index 056bdb2..e3299c0 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -48,6 +48,10 @@ services:
+         value: '9'
+       - key: SMAC_INACTIVITY_HOURS
+         value: '3'
++      - key: FALCON_LOW_ENERGY_PERCENT
++        value: '30'
++      - key: SMAC_LOW_ENERGY_PERCENT
++        value: '30'
+       - key: DATA_REFRESH_HOURS
+         value: '1'
+       # The frontend URL (Render asks for it on the first deploy), e.g. https://colbits-web.onrender.com
+@@ -108,6 +112,10 @@ services:
+         value: '9'
+       - key: SMAC_INACTIVITY_HOURS
+         value: '3'
++      - key: FALCON_LOW_ENERGY_PERCENT
++        value: '30'
++      - key: SMAC_LOW_ENERGY_PERCENT
++        value: '30'
+       - key: DATA_REFRESH_HOURS
+         value: '1'
+       # The staging frontend URL, e.g. https://colbits-web-dev.onrender.com
+-- 
+2.43.0
+
