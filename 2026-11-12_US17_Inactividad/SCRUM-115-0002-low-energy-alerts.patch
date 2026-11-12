@@ -1,0 +1,678 @@
+From 6f698a54b2de24b0ff6920f858a79e0cc70c63f2 Mon Sep 17 00:00:00 2001
+From: Yeison Delgado <yeisonestivendelgado109@gmail.com>
+Date: Thu, 12 Nov 2026 03:03:48 +0000
+Subject: [PATCH] feat(device): active low-energy alerts for Falcon and SMAC
+ (F-44, F-45)
+
+GET /device/low-energy lists one LOW_ENERGY alert per device of the user
+scope whose latest stored supercaps_per (Falcon) or battery_per (SMAC) is
+below its threshold (FALCON_LOW_ENERGY_PERCENT / SMAC_LOW_ENERGY_PERCENT,
+30 % by default). A reading at or above the threshold clears it. Each alert
+carries the level, the threshold, the reading time and since, the first
+reading of the current low streak. Lowest level first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012Za94ATKRpuhbxLyQmG5TG
+---
+ backend/src/device/device.controller.spec.ts  |  14 ++
+ backend/src/device/device.controller.ts       |  21 +++
+ backend/src/device/device.module.ts           |   3 +-
+ .../src/device/dto/low-energy-alerts.dto.ts   |  79 ++++++++++
+ .../device/low-energy-alerts.service.spec.ts  | 127 ++++++++++++++++
+ .../src/device/low-energy-alerts.service.ts   | 139 ++++++++++++++++++
+ backend/test/low-energy-alerts.e2e-spec.ts    | 132 +++++++++++++++++
+ docs/bitacora-ia/2026-11-12-SCRUM-115.md      |  12 +-
+ 8 files changed, 525 insertions(+), 2 deletions(-)
+ create mode 100644 backend/src/device/dto/low-energy-alerts.dto.ts
+ create mode 100644 backend/src/device/low-energy-alerts.service.spec.ts
+ create mode 100644 backend/src/device/low-energy-alerts.service.ts
+ create mode 100644 backend/test/low-energy-alerts.e2e-spec.ts
+
+diff --git a/backend/src/device/device.controller.spec.ts b/backend/src/device/device.controller.spec.ts
+index a24bf0c..6eb7d72 100644
+--- a/backend/src/device/device.controller.spec.ts
++++ b/backend/src/device/device.controller.spec.ts
+@@ -4,6 +4,7 @@ import { ScopeService } from '../scope/scope.service';
+ import { DeviceController } from './device.controller';
+ import { DeviceService } from './device.service';
+ import { InactiveDevicesService } from './inactive-devices.service';
++import { LowEnergyAlertsService } from './low-energy-alerts.service';
+ 
+ describe('DeviceController', () => {
+   const checkInactivity = jest.fn().mockResolvedValue({ isInactive: false });
+@@ -15,6 +16,7 @@ describe('DeviceController', () => {
+     { checkInactivity } as unknown as DeviceService,
+     { resolve } as unknown as ScopeService,
+     { inactiveDevices } as unknown as InactiveDevicesService,
++    {} as unknown as LowEnergyAlertsService,
+   );
+   const mockReq = {
+     user: { sub: 1, role: 'Colbits administrator' },
+@@ -67,10 +69,12 @@ describe('DeviceController.getInactiveDevices (US17 · F-40)', () => {
+   const inactiveDevices = jest
+     .fn()
+     .mockResolvedValue({ count: 0, devices: [] });
++  const activeAlerts = jest.fn().mockResolvedValue({ count: 0, alerts: [] });
+   const controller = new DeviceController(
+     {} as unknown as DeviceService,
+     { resolve } as unknown as ScopeService,
+     { inactiveDevices } as unknown as InactiveDevicesService,
++    { activeAlerts } as unknown as LowEnergyAlertsService,
+   );
+   const request = { user: { sub: 2 } } as unknown as Request;
+ 
+@@ -102,6 +106,16 @@ describe('DeviceController.getInactiveDevices (US17 · F-40)', () => {
+     },
+   );
+ 
++  it('F-44/F-45: reads the low-energy alerts inside the user scope', async () => {
++    await controller.getLowEnergyAlerts(request);
++
++    expect(resolve).toHaveBeenCalledWith(2);
++    expect(activeAlerts).toHaveBeenCalledWith({
++      kind: 'restricted',
++      userId: 2,
++    });
++  });
++
+   it('rejects a request without a valid user', async () => {
+     await expect(
+       controller.getInactiveDevices(undefined, {
+diff --git a/backend/src/device/device.controller.ts b/backend/src/device/device.controller.ts
+index d121a21..251493b 100644
+--- a/backend/src/device/device.controller.ts
++++ b/backend/src/device/device.controller.ts
+@@ -23,12 +23,14 @@ import { ErrorResponseDto } from '../common/dto/error-response.dto';
+ import { ScopeService } from '../scope/scope.service';
+ import { InactiveDevicesResponseDto } from './dto/inactive-devices.dto';
+ import { InactivityResultDto } from './dto/inactivity-result.dto';
++import { LowEnergyAlertsResponseDto } from './dto/low-energy-alerts.dto';
+ import { DeviceService } from './device.service';
+ import {
+   DEFAULT_WINDOW_HOURS,
+   InactiveDevicesService,
+   MAX_WINDOW_HOURS,
+ } from './inactive-devices.service';
++import { LowEnergyAlertsService } from './low-energy-alerts.service';
+ 
+ @Controller('device')
+ @UseGuards(AuthGuard)
+@@ -39,8 +41,27 @@ export class DeviceController {
+     private readonly deviceService: DeviceService,
+     private readonly scopeService: ScopeService,
+     private readonly inactiveDevicesService: InactiveDevicesService,
++    private readonly lowEnergyAlertsService: LowEnergyAlertsService,
+   ) {}
+ 
++  @Get('low-energy')
++  @ApiOperation({
++    summary:
++      'Active low-energy alerts of the user scope (F-44 Falcon supercapacitors, F-45 SMAC battery; NF-08).',
++    description:
++      'One alert per device whose latest stored reading is below its threshold: supercaps_per for a Falcon (FALCON_LOW_ENERGY_PERCENT) and battery_per for a SMAC (SMAC_LOW_ENERGY_PERCENT), 30 % by default (Colbits, CL-11). A reading below the threshold raises the alert and a reading at or above it clears it. `since` is the first reading of the current low streak. Lowest level first.',
++  })
++  @ApiOkResponse({ type: LowEnergyAlertsResponseDto })
++  @ApiUnauthorizedResponse({
++    type: ErrorResponseDto,
++    description: 'Bearer token is missing, invalid, or expired.',
++  })
++  async getLowEnergyAlerts(@Req() request: Request) {
++    const scope = await this.scopeService.resolve(userIdOf(request));
++
++    return this.lowEnergyAlertsService.activeAlerts(scope);
++  }
++
+   @Get('inactive')
+   @ApiOperation({
+     summary:
+diff --git a/backend/src/device/device.module.ts b/backend/src/device/device.module.ts
+index a485eb4..86b4bd1 100644
+--- a/backend/src/device/device.module.ts
++++ b/backend/src/device/device.module.ts
+@@ -9,6 +9,7 @@ import { ScopeModule } from '../scope/scope.module';
+ import { DeviceController } from './device.controller';
+ import { DeviceService } from './device.service';
+ import { InactiveDevicesService } from './inactive-devices.service';
++import { LowEnergyAlertsService } from './low-energy-alerts.service';
+ 
+ @Module({
+   imports: [
+@@ -25,6 +26,6 @@ import { InactiveDevicesService } from './inactive-devices.service';
+     AuthModule,
+   ],
+   controllers: [DeviceController],
+-  providers: [DeviceService, InactiveDevicesService],
++  providers: [DeviceService, InactiveDevicesService, LowEnergyAlertsService],
+ })
+ export class DeviceModule {}
+diff --git a/backend/src/device/dto/low-energy-alerts.dto.ts b/backend/src/device/dto/low-energy-alerts.dto.ts
+new file mode 100644
+index 0000000..c0412f4
+--- /dev/null
++++ b/backend/src/device/dto/low-energy-alerts.dto.ts
+@@ -0,0 +1,79 @@
++import { ApiProperty } from '@nestjs/swagger';
++import { LocationRefDto, SubstationRefDto } from './inactive-devices.dto';
++
++export class LowEnergyAlertDto {
++  @ApiProperty({ enum: ['LOW_ENERGY'], example: 'LOW_ENERGY' })
++  alert_type: 'LOW_ENERGY';
++
++  @ApiProperty({ enum: ['FALCON', 'SMAC'], example: 'FALCON' })
++  kind: 'FALCON' | 'SMAC';
++
++  @ApiProperty({
++    example: '1301000004',
++    description: 'Device hardware id (hw_id).',
++  })
++  hw_id: string;
++
++  @ApiProperty({
++    example: '0000100002-A-R',
++    description:
++      'Stable id of what the device monitors: fuse or transformer custom_id.',
++  })
++  source_id: string;
++
++  @ApiProperty({ example: '0000100002', description: 'Node identifier.' })
++  node: string;
++
++  @ApiProperty({ type: () => LocationRefDto })
++  zone: LocationRefDto;
++
++  @ApiProperty({ type: () => SubstationRefDto })
++  substation: SubstationRefDto;
++
++  @ApiProperty({ type: () => LocationRefDto })
++  circuit: LocationRefDto;
++
++  @ApiProperty({
++    example: 12,
++    description:
++      'Latest stored level in %: supercaps_per (Falcon, F-44) or battery_per (SMAC, F-45).',
++  })
++  energy_percent: number;
++
++  @ApiProperty({
++    example: 30,
++    description:
++      'Threshold it is below (NF-08: FALCON_LOW_ENERGY_PERCENT / SMAC_LOW_ENERGY_PERCENT).',
++  })
++  threshold_percent: number;
++
++  @ApiProperty({
++    format: 'date-time',
++    example: '2026-11-12T10:00:00.000Z',
++    description: 'Stored timestamp of that latest reading (F-46).',
++  })
++  recorded_at: string;
++
++  @ApiProperty({
++    format: 'date-time',
++    example: '2026-11-12T06:15:00.000Z',
++    description:
++      'First reading of the current low streak: the alert has been active since then.',
++  })
++  since: string;
++}
++
++export class LowEnergyAlertsResponseDto {
++  @ApiProperty({ example: 30 }) falcon_low_energy_percent: number;
++  @ApiProperty({ example: 30 }) smac_low_energy_percent: number;
++
++  @ApiProperty({ example: 1, description: 'Number of active alerts.' })
++  count: number;
++
++  @ApiProperty({
++    type: () => [LowEnergyAlertDto],
++    description:
++      'One active alert per device of the user scope whose latest reading is below its threshold, lowest level first.',
++  })
++  alerts: LowEnergyAlertDto[];
++}
+diff --git a/backend/src/device/low-energy-alerts.service.spec.ts b/backend/src/device/low-energy-alerts.service.spec.ts
+new file mode 100644
+index 0000000..23df1f4
+--- /dev/null
++++ b/backend/src/device/low-energy-alerts.service.spec.ts
+@@ -0,0 +1,127 @@
++import { ConfigService } from '@nestjs/config';
++import { Repository } from 'typeorm';
++import { Node } from '../nodes/node.entity';
++import {
++  LOW_ENERGY_ALERTS_SQL,
++  LowEnergyAlertsService,
++} from './low-energy-alerts.service';
++
++function serviceWith(
++  nodes: string[],
++  rows: unknown[],
++  env: Record<string, string | undefined> = {},
++) {
++  const builder = {
++    select: jest.fn().mockReturnThis(),
++    andWhere: jest.fn().mockReturnThis(),
++    setParameter: jest.fn().mockReturnThis(),
++    getMany: jest.fn().mockResolvedValue(nodes.map((name) => ({ name }))),
++  };
++  const repository = {
++    createQueryBuilder: jest.fn().mockReturnValue(builder),
++    query: jest.fn().mockResolvedValue(rows),
++  };
++  const config = { get: jest.fn((key: string) => env[key]) };
++  const service = new LowEnergyAlertsService(
++    repository as unknown as Repository<Node>,
++    config as unknown as ConfigService,
++  );
++  return { service, repository, builder };
++}
++
++const ROW = {
++  kind: 'SMAC',
++  hw_id: '0501000002',
++  source_id: '0000100005-T1-2',
++  node_id: '0000100005',
++  energy: '12',
++  threshold: '30',
++  recorded_at: '2026-11-12T10:00:00Z',
++  since: '2026-11-12T06:15:00Z',
++  zone_id: '1',
++  zone_name: 'North Ring 01',
++  substation_id: 2,
++  substation_code: 'SUB-N-002',
++  substation_name: 'S/E NORTE 2',
++  circuit_id: '2',
++  circuit_name: 'CTO 2',
++};
++
++describe('LowEnergyAlertsService (F-44, F-45, NF-08)', () => {
++  it('maps each active alert with its level, threshold and start of the low streak', async () => {
++    const { service, repository } = serviceWith(['0000100005'], [ROW]);
++
++    const result = await service.activeAlerts({ kind: 'unrestricted' });
++
++    expect(result).toEqual({
++      falcon_low_energy_percent: 30,
++      smac_low_energy_percent: 30,
++      count: 1,
++      alerts: [
++        {
++          alert_type: 'LOW_ENERGY',
++          kind: 'SMAC',
++          hw_id: '0501000002',
++          source_id: '0000100005-T1-2',
++          node: '0000100005',
++          zone: { id: 1, name: 'North Ring 01' },
++          substation: { id: 2, code: 'SUB-N-002', name: 'S/E NORTE 2' },
++          circuit: { id: 2, name: 'CTO 2' },
++          energy_percent: 12,
++          threshold_percent: 30,
++          recorded_at: '2026-11-12T10:00:00.000Z',
++          since: '2026-11-12T06:15:00.000Z',
++        },
++      ],
++    });
++    expect(repository.query).toHaveBeenCalledWith(LOW_ENERGY_ALERTS_SQL, [
++      ['0000100005'],
++      30,
++      30,
++    ]);
++  });
++
++  it('NF-08: passes the configured thresholds to the query', async () => {
++    const { service, repository } = serviceWith(['0000100005'], [], {
++      FALCON_LOW_ENERGY_PERCENT: '40',
++      SMAC_LOW_ENERGY_PERCENT: '25',
++    });
++
++    const result = await service.activeAlerts({ kind: 'unrestricted' });
++
++    expect(result).toMatchObject({
++      falcon_low_energy_percent: 40,
++      smac_low_energy_percent: 25,
++      count: 0,
++    });
++    expect(repository.query).toHaveBeenCalledWith(LOW_ENERGY_ALERTS_SQL, [
++      ['0000100005'],
++      40,
++      25,
++    ]);
++  });
++
++  it('falls back to the latest reading when the streak start is unknown', async () => {
++    const { service } = serviceWith(['0000100005'], [{ ...ROW, since: null }]);
++
++    const [alert] = (await service.activeAlerts({ kind: 'unrestricted' }))
++      .alerts;
++
++    expect(alert.since).toBe(alert.recorded_at);
++  });
++
++  it('applies the user scope and reads nothing for a user without nodes (F-10)', async () => {
++    const { service, repository, builder } = serviceWith([], []);
++
++    const result = await service.activeAlerts({
++      kind: 'restricted',
++      userId: 2,
++    });
++
++    expect(builder.andWhere).toHaveBeenCalledWith(
++      expect.stringContaining('user_scopes'),
++    );
++    expect(repository.query).not.toHaveBeenCalled();
++    expect(result.alerts).toEqual([]);
++  });
++});
+diff --git a/backend/src/device/low-energy-alerts.service.ts b/backend/src/device/low-energy-alerts.service.ts
+new file mode 100644
+index 0000000..3021d2a
+--- /dev/null
++++ b/backend/src/device/low-energy-alerts.service.ts
+@@ -0,0 +1,139 @@
++import { Injectable } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import { InjectRepository } from '@nestjs/typeorm';
++import { Repository } from 'typeorm';
++import { Node } from '../nodes/node.entity';
++import { applyNodeScope } from '../scope/scope-query.helper';
++import { ScopeContext } from '../scope/scope.types';
++import {
++  LowEnergyAlertDto,
++  LowEnergyAlertsResponseDto,
++} from './dto/low-energy-alerts.dto';
++import {
++  DeviceKind,
++  LOW_ENERGY_SETTINGS,
++  lowEnergyThreshold,
++} from './low-energy';
++
++/**
++ * Active low-energy alerts (F-44 Falcon supercapacitors, F-45 SMAC battery; Scope v6.0 §3.2).
++ * A device has an active alert while its LATEST stored reading is below its threshold ($2 Falcon,
++ * $3 SMAC, NF-08): a reading below raises it, a reading at or above it clears it. `since` is the
++ * first reading of the current low streak (after the last reading at or above the threshold).
++ * Only devices of the in-scope nodes ($1) are read.
++ */
++export const LOW_ENERGY_ALERTS_SQL = `
++  WITH low AS (
++    SELECT 'FALCON'::text AS kind, f.current_hw_id AS hw_id, f.custom_id AS source_id, fs.node_id,
++           l.supercaps_per::float8 AS energy, l.recorded_at, $2::float8 AS threshold,
++           (SELECT min(v.recorded_at) FROM public.falcon_values v
++             WHERE v.hw_id = f.current_hw_id
++               AND v.recorded_at > COALESCE(
++                 (SELECT max(o.recorded_at) FROM public.falcon_values o
++                   WHERE o.hw_id = f.current_hw_id AND o.supercaps_per >= $2::float8),
++                 '-infinity'::timestamptz)) AS since
++    FROM public.fuses f
++    JOIN public.fuses_sets fs ON fs.id = f.fuses_set_id
++    JOIN public.last_falcon_values l ON l.hw_id = f.current_hw_id
++    WHERE fs.node_id = ANY($1) AND l.supercaps_per < $2::float8
++    UNION ALL
++    SELECT 'SMAC'::text, t.current_hw_id, t.custom_id, t.node_id,
++           l.battery_per::float8, l.recorded_at, $3::float8,
++           (SELECT min(v.recorded_at) FROM public.smac_vc_values v
++             WHERE v.hw_id = t.current_hw_id
++               AND v.recorded_at > COALESCE(
++                 (SELECT max(o.recorded_at) FROM public.smac_vc_values o
++                   WHERE o.hw_id = t.current_hw_id AND o.battery_per >= $3::float8),
++                 '-infinity'::timestamptz))
++    FROM public.trafos t
++    JOIN public.last_smac_vc_values l ON l.hw_id = t.current_hw_id
++    WHERE t.node_id = ANY($1) AND l.battery_per < $3::float8
++  )
++  SELECT low.*, z.id AS zone_id, z.name AS zone_name,
++         s.id AS substation_id, s.code AS substation_code, s.name AS substation_name,
++         c.id AS circuit_id, c.name AS circuit_name
++  FROM low
++  JOIN public.nodes n ON n.name = low.node_id
++  JOIN public.circuits c ON c.id = n.circuit_id
++  JOIN public.substations s ON s.id = c.substation_id
++  JOIN public.zones z ON z.id = s.zone_id
++  ORDER BY low.energy ASC, low.since ASC, low.hw_id ASC
++`;
++
++interface LowEnergyRow {
++  kind: DeviceKind;
++  hw_id: string;
++  source_id: string;
++  node_id: string;
++  energy: number | string;
++  threshold: number | string;
++  recorded_at: Date | string;
++  since: Date | string | null;
++  zone_id: number | string;
++  zone_name: string;
++  substation_id: number | string;
++  substation_code: string;
++  substation_name: string;
++  circuit_id: number | string;
++  circuit_name: string;
++}
++
++/** US17 / Scope §3.2 · F-44, F-45: active low-energy alerts of the user scope. */
++@Injectable()
++export class LowEnergyAlertsService {
++  constructor(
++    @InjectRepository(Node)
++    private readonly nodesRepository: Repository<Node>,
++    private readonly configService: ConfigService,
++  ) {}
++
++  async activeAlerts(scope: ScopeContext): Promise<LowEnergyAlertsResponseDto> {
++    const falcon = lowEnergyThreshold(
++      this.configService.get(LOW_ENERGY_SETTINGS.FALCON),
++    );
++    const smac = lowEnergyThreshold(
++      this.configService.get(LOW_ENERGY_SETTINGS.SMAC),
++    );
++    const envelope = {
++      falcon_low_energy_percent: falcon,
++      smac_low_energy_percent: smac,
++    };
++
++    const nodesQuery = this.nodesRepository
++      .createQueryBuilder('node')
++      .select(['node.name']);
++    applyNodeScope(nodesQuery, 'node.name', scope);
++    const nodeNames = (await nodesQuery.getMany()).map((node) => node.name);
++    if (nodeNames.length === 0) return { ...envelope, count: 0, alerts: [] };
++
++    const rows: LowEnergyRow[] = await this.nodesRepository.query(
++      LOW_ENERGY_ALERTS_SQL,
++      [nodeNames, falcon, smac],
++    );
++    const alerts = rows.map(toAlert);
++    return { ...envelope, count: alerts.length, alerts };
++  }
++}
++
++function toAlert(row: LowEnergyRow): LowEnergyAlertDto {
++  const recordedAt = new Date(row.recorded_at).toISOString();
++  return {
++    alert_type: 'LOW_ENERGY',
++    kind: row.kind,
++    hw_id: row.hw_id,
++    source_id: row.source_id,
++    node: row.node_id,
++    zone: { id: Number(row.zone_id), name: row.zone_name },
++    substation: {
++      id: Number(row.substation_id),
++      code: row.substation_code,
++      name: row.substation_name,
++    },
++    circuit: { id: Number(row.circuit_id), name: row.circuit_name },
++    energy_percent: Number(row.energy),
++    threshold_percent: Number(row.threshold),
++    recorded_at: recordedAt,
++    // The latest reading is itself low, so a streak always exists; it falls back to that reading.
++    since: row.since === null ? recordedAt : new Date(row.since).toISOString(),
++  };
++}
+diff --git a/backend/test/low-energy-alerts.e2e-spec.ts b/backend/test/low-energy-alerts.e2e-spec.ts
+new file mode 100644
+index 0000000..a54ff1c
+--- /dev/null
++++ b/backend/test/low-energy-alerts.e2e-spec.ts
+@@ -0,0 +1,132 @@
++import { DataSource } from 'typeorm';
++import { LowEnergyAlertsService } from '../src/device/low-energy-alerts.service';
++import {
++  IsolatedApp,
++  createFalconNodes,
++  createSmacNodes,
++  removeFalconNodes,
++  removeSmacNodes,
++  startIsolatedApp,
++  stopIsolatedApp,
++} from './support/isolated-e2e';
++
++// F-44 / F-45 against a real database: an alert is active while the latest stored energy reading
++// of a Falcon (supercaps_per) or a SMAC (battery_per) is below its threshold (30 % by default).
++
++const LABEL = 'F-44/F-45';
++const CIRCUIT = 1;
++
++/** Falcon readings, oldest first: [hours ago, supercaps_per]. */
++const FALCONS = [
++  {
++    node: 'LOWE2E0001',
++    hw: '13E2ELO001',
++    readings: [
++      [3, 50],
++      [2, 20],
++      [1, 15],
++    ],
++  },
++  {
++    node: 'LOWE2E0002',
++    hw: '13E2ELO002',
++    readings: [
++      [2, 10],
++      [1, 45],
++    ],
++  },
++  { node: 'LOWE2E0003', hw: '13E2ELO003', readings: [[1, 30]] },
++];
++const SMAC = { node: 'LOWE2E0004', hw: '05E2ELO004', battery: 8 };
++const OURS = new Set([...FALCONS.map((f) => f.hw), SMAC.hw]);
++
++async function remove(dataSource: DataSource): Promise<void> {
++  await removeFalconNodes(
++    dataSource,
++    FALCONS.map((f) => f.node),
++    FALCONS.map((f) => f.hw),
++  );
++  await removeSmacNodes(dataSource, [SMAC.node], [SMAC.hw]);
++}
++
++async function create(dataSource: DataSource): Promise<void> {
++  for (const [index, f] of FALCONS.entries()) {
++    await createFalconNodes(
++      dataSource,
++      [
++        {
++          node: f.node,
++          fuseSetId: 990_200 + index,
++          fuses: [
++            { customId: `${f.node}-R`, phase: 'R', hwId: f.hw, reading: null },
++          ],
++        },
++      ],
++      CIRCUIT,
++    );
++    for (const [hoursAgo, level] of f.readings) {
++      await dataSource.query(
++        `INSERT INTO falcon_values (hw_id, custom_id, recorded_at, supercaps_per)
++         VALUES ($1, $2, now() - $3 * interval '1 hour', $4)`,
++        [f.hw, `${f.node}-R`, hoursAgo, level],
++      );
++    }
++  }
++  await createSmacNodes(
++    dataSource,
++    [
++      {
++        node: SMAC.node,
++        transformers: [
++          { customId: `${SMAC.node}-T1-3`, hwId: SMAC.hw, readings: [] },
++        ],
++      },
++    ],
++    CIRCUIT,
++  );
++  await dataSource.query(
++    `INSERT INTO smac_vc_values (hw_id, custom_id, recorded_at, battery_per)
++     VALUES ($1, $2, now() - interval '30 minutes', $3)`,
++    [SMAC.hw, `${SMAC.node}-T1-3`, SMAC.battery],
++  );
++}
++
++describe('F-44 / F-45 low-energy alerts (e2e)', () => {
++  let started: IsolatedApp | undefined;
++
++  beforeAll(async () => {
++    started = await startIsolatedApp(LABEL, { remove, create });
++  });
++
++  afterAll(() => stopIsolatedApp(started, LABEL, remove));
++
++  const alerts = async () => {
++    if (!started) throw new Error('app did not start');
++    const result = await started.app
++      .get(LowEnergyAlertsService)
++      .activeAlerts({ kind: 'unrestricted' });
++    return result.alerts.filter((a) => OURS.has(a.hw_id));
++  };
++
++  it('raises an alert for a SMAC battery and a Falcon below 30 %, lowest first', async () => {
++    expect((await alerts()).map((a) => [a.node, a.energy_percent])).toEqual([
++      ['LOWE2E0004', 8],
++      ['LOWE2E0001', 15],
++    ]);
++  });
++
++  it('a reading above the threshold clears the alert; exactly 30 % is not low', async () => {
++    const nodes = (await alerts()).map((a) => a.node);
++    expect(nodes).not.toContain('LOWE2E0002');
++    expect(nodes).not.toContain('LOWE2E0003');
++  });
++
++  it('the alert is active since the first reading of the current low streak', async () => {
++    const alert = (await alerts()).find((a) => a.node === 'LOWE2E0001');
++    const hoursAgo =
++      (Date.now() - new Date(alert!.since).getTime()) / 3_600_000;
++    expect(hoursAgo).toBeGreaterThan(1.9);
++    expect(hoursAgo).toBeLessThan(2.1);
++    expect(alert).toMatchObject({ kind: 'FALCON', threshold_percent: 30 });
++  });
++});
+diff --git a/docs/bitacora-ia/2026-11-12-SCRUM-115.md b/docs/bitacora-ia/2026-11-12-SCRUM-115.md
+index b0c077a..e1685fd 100644
+--- a/docs/bitacora-ia/2026-11-12-SCRUM-115.md
++++ b/docs/bitacora-ia/2026-11-12-SCRUM-115.md
+@@ -1,7 +1,7 @@
+ # AI log — SCRUM-115 backend (US17 · F-38, F-39, F-40; NF-08) — 2026-11-12
+ 
+ **Author:** Yeison Delgado · **Tool:** Claude (Claude Code)
+-Covers SCRUM-232 (F-38), SCRUM-233 (F-39), SCRUM-234 (F-40) and SCRUM-244 (NF-08).
++Covers SCRUM-232 (F-38), SCRUM-233 (F-39), SCRUM-234 (F-40), SCRUM-244 (NF-08), SCRUM-242 (F-44) and SCRUM-243 (F-45).
+ 
+ ## What the AI generated
+ - `GET /device/inactive?hours=24` (`device.controller.ts`, `inactive-devices.service.ts`, Swagger DTO
+@@ -24,3 +24,13 @@ Covers SCRUM-232 (F-38), SCRUM-233 (F-39), SCRUM-234 (F-40) and SCRUM-244 (NF-08
+ - Ran: 510 unit tests, lint, build; e2e on PostgreSQL with Colbits' triggers (95 + 3, 7 new); a duplication
+   check (0 clones). With generator data, the real API listed the 3 silent devices and the inactivity scenarios
+   in F-40 order, and closed the alarm of a device that reported again at that record.
++
++## Second commit: low-energy alerts (F-44, F-45)
++- `GET /device/low-energy` (`low-energy-alerts.service.ts`, DTO `dto/low-energy-alerts.dto.ts`): one active alert per
++  device of the scope whose latest stored `supercaps_per` (Falcon) or `battery_per` (SMAC) is below its NF-08
++  threshold. A reading at or above the threshold clears it (F-44/F-45 acceptance). `since` = first reading of the
++  current low streak.
++- Kept in the device module, not in `GET /faults`, because the fault list and its frontend do not handle the
++  LOW_ENERGY type yet. It can be merged there later with the team.
++- Ran: 515 unit tests, lint, build; e2e 98 + 3 (3 new: lowest first, exactly 30 % is not low, a reading above clears
++  it, start of the streak); duplication check 0 clones.
+-- 
+2.43.0
+
