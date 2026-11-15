@@ -1,0 +1,1666 @@
+From 3d3a633cf3055c3ce95936739921dd268fd77964 Mon Sep 17 00:00:00 2001
+From: Yeison Delgado <yeisonestivendelgado109@gmail.com>
+Date: Sun, 15 Nov 2026 19:49:12 +0000
+Subject: [PATCH] feat(scenarios): demo scenario service for fuses, voltage and
+ phases (US31, F-100)
+
+GET /scenarios tells the frontend whether demo mode is on and which
+actions exist. POST /scenarios runs OPEN_FUSE, CLOSE_FUSE, CUT_VOLTAGE,
+RESTORE_VOLTAGE, DROP_PHASE or RESTORE_PHASE on a fuse or transformer:
+it writes the telemetry reading and the Technical Annex alarm event the
+device would send, so the map and the alarm list react through their
+normal rules. Off unless DEMO_SCENARIOS_ENABLED=true (on for local
+docker-compose and Render staging), administrators only, scope applied,
+and an action that repeats the current state is refused with 409.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012Za94ATKRpuhbxLyQmG5TG
+---
+ backend/.env.example                          |   4 +
+ backend/src/app.module.ts                     |   2 +
+ backend/src/scenarios/dto/scenarios.dto.ts    | 101 +++++
+ .../src/scenarios/scenario-actions.spec.ts    |  62 +++
+ backend/src/scenarios/scenario-actions.ts     | 159 +++++++
+ .../scenarios/scenarios.controller.spec.ts    |  62 +++
+ backend/src/scenarios/scenarios.controller.ts | 109 +++++
+ backend/src/scenarios/scenarios.module.ts     |  29 ++
+ .../src/scenarios/scenarios.service.spec.ts   | 337 +++++++++++++++
+ backend/src/scenarios/scenarios.service.ts    | 397 ++++++++++++++++++
+ backend/test/scenarios.e2e-spec.ts            | 213 ++++++++++
+ docker-compose.yml                            |   2 +
+ docs/bitacora-ia/2026-11-15-SCRUM-252.md      |  23 +
+ render.yaml                                   |   4 +
+ 14 files changed, 1504 insertions(+)
+ create mode 100644 backend/src/scenarios/dto/scenarios.dto.ts
+ create mode 100644 backend/src/scenarios/scenario-actions.spec.ts
+ create mode 100644 backend/src/scenarios/scenario-actions.ts
+ create mode 100644 backend/src/scenarios/scenarios.controller.spec.ts
+ create mode 100644 backend/src/scenarios/scenarios.controller.ts
+ create mode 100644 backend/src/scenarios/scenarios.module.ts
+ create mode 100644 backend/src/scenarios/scenarios.service.spec.ts
+ create mode 100644 backend/src/scenarios/scenarios.service.ts
+ create mode 100644 backend/test/scenarios.e2e-spec.ts
+ create mode 100644 docs/bitacora-ia/2026-11-15-SCRUM-252.md
+
+diff --git a/backend/.env.example b/backend/.env.example
+index 7d1fd71..67eaac3 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -40,3 +40,7 @@ SMAC_VOLTAGE_UNBALANCE_PERCENT=2
+ # Current imbalance above this cuf_percent. LEFT EMPTY ON PURPOSE: TD-10 has no approved value (CL-06), so the
+ # current-imbalance condition stays disabled until the team agrees one. Set a number above zero to enable it.
+ SMAC_CURRENT_UNBALANCE_PERCENT=
++
++# Demo scenario panel (US31 · F-100): POST /scenarios writes test readings and alarms.
++# Only true in local/demo environments with generated data, never against Colbits' data (NF-03).
++DEMO_SCENARIOS_ENABLED=false
+diff --git a/backend/src/app.module.ts b/backend/src/app.module.ts
+index d1aab21..bc4ed85 100644
+--- a/backend/src/app.module.ts
++++ b/backend/src/app.module.ts
+@@ -9,6 +9,7 @@ import { NodesModule } from './nodes/nodes.module';
+ import { ScopeModule } from './scope/scope.module';
+ import { FaultsModule } from './faults/faults.module';
+ import { UsersModule } from './users/users.module';
++import { ScenariosModule } from './scenarios/scenarios.module';
+ 
+ @Module({
+   imports: [
+@@ -33,6 +34,7 @@ import { UsersModule } from './users/users.module';
+     }),
+     FaultsModule,
+     UsersModule,
++    ScenariosModule,
+   ],
+   controllers: [AppController],
+   providers: [AppService],
+diff --git a/backend/src/scenarios/dto/scenarios.dto.ts b/backend/src/scenarios/dto/scenarios.dto.ts
+new file mode 100644
+index 0000000..1268b8a
+--- /dev/null
++++ b/backend/src/scenarios/dto/scenarios.dto.ts
+@@ -0,0 +1,101 @@
++import { ApiProperty } from '@nestjs/swagger';
++import { SCENARIO_ACTION_NAMES, SMAC_CHANNELS } from '../scenario-actions';
++import type { ScenarioAction, ScenarioChannel } from '../scenario-actions';
++
++export class ScenarioActionInfoDto {
++  @ApiProperty({ enum: SCENARIO_ACTION_NAMES, example: 'OPEN_FUSE' })
++  action: ScenarioAction;
++
++  @ApiProperty({
++    enum: ['FUSE', 'TRANSFORMER'],
++    example: 'FUSE',
++    description:
++      'What `target` must be: a fuse custom_id or a transformer custom_id (both listed by GET /nodes/{name}/detail).',
++  })
++  target: 'FUSE' | 'TRANSFORMER';
++
++  @ApiProperty({
++    example: false,
++    description: 'Whether `channel` (A, B or C) is required.',
++  })
++  channel_required: boolean;
++
++  @ApiProperty({
++    example:
++      'Fuse layer: node CRITICAL (red); an open FUSE_OPENING fault in GET /faults.',
++  })
++  effect: string;
++}
++
++export class ScenariosStatusDto {
++  @ApiProperty({
++    example: true,
++    description:
++      'Demo mode: true only where DEMO_SCENARIOS_ENABLED=true. The frontend shows the scenario panel only when it is true; POST /scenarios answers 403 otherwise.',
++  })
++  enabled: boolean;
++
++  @ApiProperty({ type: () => [ScenarioActionInfoDto] })
++  actions: ScenarioActionInfoDto[];
++}
++
++export class RunScenarioDto {
++  @ApiProperty({ enum: SCENARIO_ACTION_NAMES, example: 'OPEN_FUSE' })
++  action: ScenarioAction;
++
++  @ApiProperty({
++    example: '0000100002-A-R',
++    description:
++      'Fuse custom_id for OPEN_FUSE, CLOSE_FUSE, CUT_VOLTAGE, RESTORE_VOLTAGE; transformer custom_id for DROP_PHASE, RESTORE_PHASE.',
++  })
++  target: string;
++
++  @ApiProperty({
++    enum: [...SMAC_CHANNELS],
++    required: false,
++    example: 'A',
++    description: 'SMAC channel, only for DROP_PHASE and RESTORE_PHASE.',
++  })
++  channel?: ScenarioChannel;
++}
++
++export class ScenarioResultDto {
++  @ApiProperty({ enum: SCENARIO_ACTION_NAMES, example: 'OPEN_FUSE' })
++  action: ScenarioAction;
++
++  @ApiProperty({ example: '0000100002' })
++  node: string;
++
++  @ApiProperty({ example: '0000100002-A-R' })
++  target: string;
++
++  @ApiProperty({ type: String, nullable: true, example: null })
++  channel: ScenarioChannel | null;
++
++  @ApiProperty({
++    example: '1301000004',
++    description: 'Device that "reported" it.',
++  })
++  hw_id: string;
++
++  @ApiProperty({
++    example: '131420',
++    description: 'Event code written to alarms (Annex §4.2).',
++  })
++  event_code: string;
++
++  @ApiProperty({ enum: ['SET', 'CLEAR'], example: 'SET' })
++  event_type: 'SET' | 'CLEAR';
++
++  @ApiProperty({
++    format: 'date-time',
++    description: 'Timestamp of the reading and the event.',
++  })
++  recorded_at: string;
++
++  @ApiProperty({
++    example:
++      'Fuse layer: node CRITICAL (red); an open FUSE_OPENING fault in GET /faults.',
++  })
++  effect: string;
++}
+diff --git a/backend/src/scenarios/scenario-actions.spec.ts b/backend/src/scenarios/scenario-actions.spec.ts
+new file mode 100644
+index 0000000..3df4662
+--- /dev/null
++++ b/backend/src/scenarios/scenario-actions.spec.ts
+@@ -0,0 +1,62 @@
++import {
++  SCENARIO_ACTION_NAMES,
++  alarmTextOf,
++  alarmValueOf,
++  eventCodeOf,
++  isScenarioAction,
++  isScenarioChannel,
++  repeatsCurrentState,
++} from './scenario-actions';
++import { classifyEventCode } from '../faults/fault-alert-types';
++
++describe('scenario actions (US31 · F-100)', () => {
++  it('offers the six SCRUM-252 actions', () => {
++    expect(SCENARIO_ACTION_NAMES).toEqual([
++      'OPEN_FUSE',
++      'CLOSE_FUSE',
++      'CUT_VOLTAGE',
++      'RESTORE_VOLTAGE',
++      'DROP_PHASE',
++      'RESTORE_PHASE',
++    ]);
++  });
++
++  it('writes Technical Annex §4.2 codes that the fault list classifies as the right alert', () => {
++    expect(eventCodeOf('OPEN_FUSE', '14', null)).toBe('131420');
++    expect(eventCodeOf('CUT_VOLTAGE', '14', null)).toBe('131421');
++    expect(eventCodeOf('DROP_PHASE', '15', 'C')).toBe('051521C');
++    expect(classifyEventCode(eventCodeOf('CLOSE_FUSE', '14', null))).toBe(
++      'FUSE_OPENING',
++    );
++    expect(classifyEventCode(eventCodeOf('RESTORE_VOLTAGE', '14', null))).toBe(
++      'NO_VOLTAGE',
++    );
++    expect(classifyEventCode(eventCodeOf('RESTORE_PHASE', '14', 'A'))).toBe(
++      'PHASE_LOSS',
++    );
++  });
++
++  it('uses the alarm texts and values of Colbits devices', () => {
++    expect(alarmTextOf('OPEN_FUSE', null)).toBe('Fusible abierto');
++    expect(alarmTextOf('RESTORE_VOLTAGE', null)).toBe('Tensión normalizada');
++    expect(alarmTextOf('DROP_PHASE', 'B')).toBe('Caída de la fase B');
++    expect(alarmValueOf('OPEN_FUSE')).toBe('125°');
++    expect(alarmValueOf('CUT_VOLTAGE')).toBeNull();
++    expect(alarmValueOf('RESTORE_PHASE')).toBe('220');
++  });
++
++  it('refuses an action that repeats the current state', () => {
++    expect(repeatsCurrentState('OPEN_FUSE', true)).toBe(true);
++    expect(repeatsCurrentState('OPEN_FUSE', false)).toBe(false);
++    expect(repeatsCurrentState('CLOSE_FUSE', false)).toBe(true);
++    expect(repeatsCurrentState('RESTORE_PHASE', true)).toBe(false);
++  });
++
++  it('validates the action and the channel', () => {
++    expect(isScenarioAction('DROP_PHASE')).toBe(true);
++    expect(isScenarioAction('toString')).toBe(false);
++    expect(isScenarioAction(7)).toBe(false);
++    expect(isScenarioChannel('C')).toBe(true);
++    expect(isScenarioChannel('D')).toBe(false);
++  });
++});
+diff --git a/backend/src/scenarios/scenario-actions.ts b/backend/src/scenarios/scenario-actions.ts
+new file mode 100644
+index 0000000..6061b81
+--- /dev/null
++++ b/backend/src/scenarios/scenario-actions.ts
+@@ -0,0 +1,159 @@
++/**
++ * Demo scenarios (US31 · F-100, SCRUM-252): what each action writes, as a real device would.
++ *
++ * A scenario never changes how the platform computes anything. It inserts one telemetry reading
++ * and one alarm event with the Technical Annex §4.2 codes, exactly like a Falcon or a SMAC, so the
++ * map (GET /nodes), the alarm list (GET /faults) and the node detail react through their normal
++ * rules within one refresh. Javier's SCRUM-253 adds the other actions to SCENARIO_ACTIONS.
++ */
++export const SCENARIO_ACTIONS = {
++  OPEN_FUSE: {
++    device: 'FALCON',
++    event: '20',
++    eventType: 'SET',
++    channel: false,
++  },
++  CLOSE_FUSE: {
++    device: 'FALCON',
++    event: '20',
++    eventType: 'CLEAR',
++    channel: false,
++  },
++  CUT_VOLTAGE: {
++    device: 'FALCON',
++    event: '21',
++    eventType: 'SET',
++    channel: false,
++  },
++  RESTORE_VOLTAGE: {
++    device: 'FALCON',
++    event: '21',
++    eventType: 'CLEAR',
++    channel: false,
++  },
++  DROP_PHASE: { device: 'SMAC', event: '21', eventType: 'SET', channel: true },
++  RESTORE_PHASE: {
++    device: 'SMAC',
++    event: '21',
++    eventType: 'CLEAR',
++    channel: true,
++  },
++} as const satisfies Record<
++  string,
++  {
++    device: 'FALCON' | 'SMAC';
++    event: '20' | '21';
++    eventType: 'SET' | 'CLEAR';
++    channel: boolean;
++  }
++>;
++
++export type ScenarioAction = keyof typeof SCENARIO_ACTIONS;
++export const SCENARIO_ACTION_NAMES = Object.keys(
++  SCENARIO_ACTIONS,
++) as ScenarioAction[];
++export const SMAC_CHANNELS = ['A', 'B', 'C'] as const;
++export type ScenarioChannel = (typeof SMAC_CHANNELS)[number];
++
++/** Setting that turns the scenarios on. Off by default: they write data (NF-03). */
++export const DEMO_SCENARIOS_SETTING = 'DEMO_SCENARIOS_ENABLED';
++
++/** Firmware digits used when the device has no previous event (seed and generator use 14). */
++export const DEFAULT_FIRMWARE = '14';
++
++/** Telemetry values written by the scenarios. */
++export const OPEN_FUSE_ANGLE = 125;
++export const CLOSED_FUSE_ANGLE = 1;
++export const DROPPED_PHASE_VOLTS = 0;
++export const NOMINAL_PHASE_VOLTS = 220;
++
++export function isScenarioAction(value: unknown): value is ScenarioAction {
++  return (
++    typeof value === 'string' &&
++    Object.prototype.hasOwnProperty.call(SCENARIO_ACTIONS, value)
++  );
++}
++
++export function isScenarioChannel(value: unknown): value is ScenarioChannel {
++  return (
++    typeof value === 'string' &&
++    (SMAC_CHANNELS as readonly string[]).includes(value)
++  );
++}
++
++/** Annex §4.2 event code: device prefix (13 / 05) + firmware + event (+ channel on SMAC). */
++export function eventCodeOf(
++  action: ScenarioAction,
++  firmware: string,
++  channel: ScenarioChannel | null,
++): string {
++  const { device, event } = SCENARIO_ACTIONS[action];
++  return `${device === 'FALCON' ? '13' : '05'}${firmware}${event}${channel ?? ''}`;
++}
++
++/** Alarm text as Colbits' devices write it (seed data, Spanish). */
++export function alarmTextOf(
++  action: ScenarioAction,
++  channel: ScenarioChannel | null,
++): string {
++  switch (action) {
++    case 'OPEN_FUSE':
++      return 'Fusible abierto';
++    case 'CLOSE_FUSE':
++      return 'Fusible cerrado';
++    case 'CUT_VOLTAGE':
++      return 'Ausencia de tensión';
++    case 'RESTORE_VOLTAGE':
++      return 'Tensión normalizada';
++    case 'DROP_PHASE':
++      return `Caída de la fase ${channel}`;
++    case 'RESTORE_PHASE':
++      return `Recuperación de la fase ${channel}`;
++  }
++}
++
++/** Value column of the alarm: the angle of a fuse holder, the voltage of a phase. */
++export function alarmValueOf(action: ScenarioAction): string | null {
++  switch (action) {
++    case 'OPEN_FUSE':
++      return `${OPEN_FUSE_ANGLE}°`;
++    case 'CLOSE_FUSE':
++      return `${CLOSED_FUSE_ANGLE}°`;
++    case 'DROP_PHASE':
++      return String(DROPPED_PHASE_VOLTS);
++    case 'RESTORE_PHASE':
++      return String(NOMINAL_PHASE_VOLTS);
++    default:
++      return null;
++  }
++}
++
++/**
++ * Whether the action would repeat the current state: opening an open fuse, restoring a voltage
++ * that was never cut... A repeated SET or CLEAR would break the alarm pairs the fault list reads,
++ * so it is refused (409) instead.
++ */
++export function repeatsCurrentState(
++  action: ScenarioAction,
++  active: boolean,
++): boolean {
++  return SCENARIO_ACTIONS[action].eventType === 'SET' ? active : !active;
++}
++
++/** What the platform shows after the action, for the panel and for testers. */
++export function expectedEffectOf(action: ScenarioAction): string {
++  switch (action) {
++    case 'OPEN_FUSE':
++      return 'Fuse layer: node CRITICAL (red); an open FUSE_OPENING fault in GET /faults.';
++    case 'CLOSE_FUSE':
++      return 'The FUSE_OPENING fault resolves; the node returns to its other states.';
++    case 'CUT_VOLTAGE':
++      return 'Fuse layer: node WARNING (yellow) unless a fuse is open; an open NO_VOLTAGE alarm.';
++    case 'RESTORE_VOLTAGE':
++      return 'The NO_VOLTAGE alarm resolves.';
++    case 'DROP_PHASE':
++      return 'Transformer layer: WARNING with one phase down, CRITICAL with two or more; an open PHASE_LOSS alarm.';
++    case 'RESTORE_PHASE':
++      return 'The PHASE_LOSS alarm resolves; the transformer state is recomputed.';
++  }
++}
+diff --git a/backend/src/scenarios/scenarios.controller.spec.ts b/backend/src/scenarios/scenarios.controller.spec.ts
+new file mode 100644
+index 0000000..7bf71d9
+--- /dev/null
++++ b/backend/src/scenarios/scenarios.controller.spec.ts
+@@ -0,0 +1,62 @@
++import { ForbiddenException, UnauthorizedException } from '@nestjs/common';
++import type { Request } from 'express';
++import { ScopeService } from '../scope/scope.service';
++import { ScenariosController } from './scenarios.controller';
++import { ScenariosService } from './scenarios.service';
++
++function controllerWith() {
++  const resolve = jest.fn().mockResolvedValue({ kind: 'unrestricted' });
++  const run = jest.fn().mockResolvedValue({ action: 'OPEN_FUSE' });
++  const status = jest.fn().mockReturnValue({ enabled: true, actions: [] });
++  const controller = new ScenariosController(
++    { run, status } as unknown as ScenariosService,
++    { resolve } as unknown as ScopeService,
++  );
++  return { controller, resolve, run, status };
++}
++
++const requestFor = (user?: Record<string, unknown>) =>
++  ({ user }) as unknown as Request;
++const BODY = { action: 'OPEN_FUSE', target: '0000100002-A-R' } as const;
++
++describe('ScenariosController (US31 · F-100)', () => {
++  it('GET returns the demo-mode status', () => {
++    const { controller, status } = controllerWith();
++
++    expect(controller.status()).toEqual({ enabled: true, actions: [] });
++    expect(status).toHaveBeenCalled();
++  });
++
++  it('POST runs the scenario in the scope of the administrator in the token', async () => {
++    const { controller, resolve, run } = controllerWith();
++
++    await controller.run(
++      BODY,
++      requestFor({ sub: 1, role: 'Colbits administrator' }),
++    );
++
++    expect(resolve).toHaveBeenCalledWith(1);
++    expect(run).toHaveBeenCalledWith(BODY, { kind: 'unrestricted' });
++  });
++
++  it('POST refuses a consultation user', async () => {
++    const { controller, run } = controllerWith();
++
++    await expect(
++      controller.run(BODY, requestFor({ sub: 2, role: 'consultation user' })),
++    ).rejects.toThrow(ForbiddenException);
++    expect(run).not.toHaveBeenCalled();
++  });
++
++  it('POST refuses a token without a valid user id', async () => {
++    const { controller, run } = controllerWith();
++
++    await expect(
++      controller.run(
++        BODY,
++        requestFor({ sub: '1', role: 'Colbits administrator' }),
++      ),
++    ).rejects.toThrow(UnauthorizedException);
++    expect(run).not.toHaveBeenCalled();
++  });
++});
+diff --git a/backend/src/scenarios/scenarios.controller.ts b/backend/src/scenarios/scenarios.controller.ts
+new file mode 100644
+index 0000000..915a4e7
+--- /dev/null
++++ b/backend/src/scenarios/scenarios.controller.ts
+@@ -0,0 +1,109 @@
++import {
++  Body,
++  Controller,
++  ForbiddenException,
++  Get,
++  HttpCode,
++  Post,
++  Req,
++  UnauthorizedException,
++  UseGuards,
++} from '@nestjs/common';
++import type { Request } from 'express';
++import {
++  ApiBadRequestResponse,
++  ApiBearerAuth,
++  ApiConflictResponse,
++  ApiCreatedResponse,
++  ApiForbiddenResponse,
++  ApiNotFoundResponse,
++  ApiOkResponse,
++  ApiOperation,
++  ApiTags,
++  ApiUnauthorizedResponse,
++} from '@nestjs/swagger';
++import { AuthGuard } from '../auth/auth.guard';
++import { RolesGuard } from '../auth/roles.guard';
++import { ErrorResponseDto } from '../common/dto/error-response.dto';
++import { ScopeService } from '../scope/scope.service';
++import {
++  RunScenarioDto,
++  ScenarioResultDto,
++  ScenariosStatusDto,
++} from './dto/scenarios.dto';
++import { ScenariosService } from './scenarios.service';
++
++const ADMIN_ROLE = 'Colbits administrator';
++
++@Controller('scenarios')
++@UseGuards(AuthGuard, RolesGuard)
++@ApiTags('scenarios')
++@ApiBearerAuth()
++export class ScenariosController {
++  constructor(
++    private readonly scenariosService: ScenariosService,
++    private readonly scopeService: ScopeService,
++  ) {}
++
++  @Get()
++  @ApiOperation({
++    summary: 'Demo mode and the scenarios it offers (US31 · F-100).',
++    description:
++      'enabled is true only where DEMO_SCENARIOS_ENABLED=true (never in production, NF-03). The frontend shows the scenario panel only when enabled is true.',
++  })
++  @ApiOkResponse({ type: ScenariosStatusDto })
++  @ApiUnauthorizedResponse({ type: ErrorResponseDto })
++  status() {
++    return this.scenariosService.status();
++  }
++
++  @Post()
++  @HttpCode(201)
++  @ApiOperation({
++    summary:
++      'Run a demo scenario: open or close a fuse, cut or restore voltage, drop or restore a transformer phase (US31 · F-100).',
++    description:
++      'Writes what the device would send: one telemetry reading (falcon_values or smac_vc_values) and one alarm event with the Technical Annex §4.2 code (13xx20, 13xx21, 05xx21y), SET or CLEAR, both stamped now. The map, GET /faults and the node detail then react through their normal rules on the next refresh. Only for Colbits administrators, inside their scope, and only in demo mode. An action that would repeat the current state (opening an open fuse) is refused with 409.',
++  })
++  @ApiCreatedResponse({ type: ScenarioResultDto })
++  @ApiBadRequestResponse({
++    type: ErrorResponseDto,
++    description:
++      'Unknown action, missing target, channel missing or not allowed, the device or channel does not exist.',
++  })
++  @ApiUnauthorizedResponse({ type: ErrorResponseDto })
++  @ApiForbiddenResponse({
++    type: ErrorResponseDto,
++    description:
++      'Demo mode is off, or the user is not a Colbits administrator.',
++  })
++  @ApiNotFoundResponse({
++    type: ErrorResponseDto,
++    description: 'Target not found, or outside the user scope.',
++  })
++  @ApiConflictResponse({
++    type: ErrorResponseDto,
++    description: 'The target is already in the state the action would set.',
++  })
++  async run(@Body() body: RunScenarioDto, @Req() request: Request) {
++    const user = (
++      request as Request & { user?: { sub?: unknown; role?: unknown } }
++    ).user;
++    const userId = user?.sub;
++    if (
++      typeof userId !== 'number' ||
++      !Number.isSafeInteger(userId) ||
++      userId <= 0
++    ) {
++      throw new UnauthorizedException('Invalid user identity');
++    }
++    if (user?.role !== ADMIN_ROLE) {
++      throw new ForbiddenException(
++        'Only Colbits administrators can run demo scenarios',
++      );
++    }
++
++    const scope = await this.scopeService.resolve(userId);
++    return this.scenariosService.run(body, scope);
++  }
++}
+diff --git a/backend/src/scenarios/scenarios.module.ts b/backend/src/scenarios/scenarios.module.ts
+new file mode 100644
+index 0000000..ed2ea43
+--- /dev/null
++++ b/backend/src/scenarios/scenarios.module.ts
+@@ -0,0 +1,29 @@
++import { Module } from '@nestjs/common';
++import { ConfigModule, ConfigService } from '@nestjs/config';
++import { JwtModule } from '@nestjs/jwt';
++import { TypeOrmModule } from '@nestjs/typeorm';
++import { AuthModule } from '../auth/auth.module';
++import { TokenBlacklist } from '../auth/token-blacklist.entity';
++import { Node } from '../nodes/node.entity';
++import { ScopeModule } from '../scope/scope.module';
++import { ScenariosController } from './scenarios.controller';
++import { ScenariosService } from './scenarios.service';
++
++@Module({
++  imports: [
++    TypeOrmModule.forFeature([Node, TokenBlacklist]),
++    JwtModule.registerAsync({
++      imports: [ConfigModule],
++      inject: [ConfigService],
++      useFactory: (configService: ConfigService) => ({
++        secret: configService.get<string>('JWT_SECRET'),
++        signOptions: { expiresIn: '15m' },
++      }),
++    }),
++    ScopeModule,
++    AuthModule,
++  ],
++  controllers: [ScenariosController],
++  providers: [ScenariosService],
++})
++export class ScenariosModule {}
+diff --git a/backend/src/scenarios/scenarios.service.spec.ts b/backend/src/scenarios/scenarios.service.spec.ts
+new file mode 100644
+index 0000000..5d41815
+--- /dev/null
++++ b/backend/src/scenarios/scenarios.service.spec.ts
+@@ -0,0 +1,337 @@
++import {
++  BadRequestException,
++  ConflictException,
++  ForbiddenException,
++  NotFoundException,
++} from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import { Repository } from 'typeorm';
++import { Node } from '../nodes/node.entity';
++import {
++  FIRMWARE_SQL,
++  FUSE_TARGET_SQL,
++  INSERT_ALARM_SQL,
++  INSERT_FALCON_READING_SQL,
++  INSERT_SMAC_READING_SQL,
++  LATEST_EVENT_SQL,
++  ScenariosService,
++  TRANSFORMER_TARGET_SQL,
++} from './scenarios.service';
++
++const NOW = new Date('2026-11-15T15:00:00.000Z');
++const FUSE = {
++  custom_id: '0000100002-A-R',
++  hw_id: '1301000004',
++  node_id: '0000100002',
++  fuse_state: 'Cerrado',
++  is_voltage_present: true,
++};
++const TRAFO = {
++  custom_id: '0000100004-T1-3',
++  hw_id: '0501000001',
++  node_id: '0000100004',
++  va: 220,
++  vb: 221,
++  vc: null,
++  has_reading: true,
++};
++
++function serviceWith(
++  options: {
++    enabled?: string;
++    fuse?: unknown;
++    trafo?: unknown;
++    latest?: string | null;
++    firmware?: string | null;
++    inScope?: boolean;
++  } = {},
++) {
++  const {
++    enabled = 'true',
++    latest = null,
++    firmware = '14',
++    inScope = true,
++  } = options;
++  const fuse = 'fuse' in options ? options.fuse : FUSE;
++  const trafo = 'trafo' in options ? options.trafo : TRAFO;
++  const writes: [string, unknown[]][] = [];
++  const builder = {
++    where: jest.fn().mockReturnThis(),
++    andWhere: jest.fn().mockReturnThis(),
++    setParameter: jest.fn().mockReturnThis(),
++    getCount: jest.fn().mockResolvedValue(inScope ? 1 : 0),
++  };
++  const query = jest.fn((sql: string) => {
++    if (sql === FUSE_TARGET_SQL) return Promise.resolve(fuse ? [fuse] : []);
++    if (sql === TRANSFORMER_TARGET_SQL) {
++      return Promise.resolve(trafo ? [trafo] : []);
++    }
++    if (sql === LATEST_EVENT_SQL) {
++      return Promise.resolve(latest ? [{ event_type: latest }] : []);
++    }
++    if (sql === FIRMWARE_SQL) {
++      return Promise.resolve(firmware ? [{ firmware }] : []);
++    }
++    return Promise.resolve([]);
++  });
++  const manager = {
++    transaction: jest.fn(
++      async (work: (m: { query: jest.Mock }) => Promise<void>) => {
++        await work({
++          query: jest.fn((sql: string, params: unknown[]) => {
++            writes.push([sql, params]);
++            return Promise.resolve([]);
++          }),
++        });
++      },
++    ),
++  };
++  const repository = {
++    createQueryBuilder: jest.fn().mockReturnValue(builder),
++    query,
++    manager,
++  };
++  const config = {
++    get: jest.fn((key: string) =>
++      key === 'DEMO_SCENARIOS_ENABLED' ? enabled : undefined,
++    ),
++  };
++  const service = new ScenariosService(
++    repository as unknown as Repository<Node>,
++    config as unknown as ConfigService,
++  );
++  return { service, writes, query };
++}
++
++const ADMIN = { kind: 'unrestricted' } as const;
++
++describe('ScenariosService (US31 · F-100, SCRUM-252)', () => {
++  it('status: demo mode only when DEMO_SCENARIOS_ENABLED is "true"', () => {
++    expect(serviceWith().service.status().enabled).toBe(true);
++    expect(serviceWith({ enabled: 'false' }).service.status().enabled).toBe(
++      false,
++    );
++    expect(serviceWith({ enabled: '' }).service.status().enabled).toBe(false);
++    expect(serviceWith().service.status().actions[4]).toMatchObject({
++      action: 'DROP_PHASE',
++      target: 'TRANSFORMER',
++      channel_required: true,
++    });
++  });
++
++  it('refuses to write anything when demo mode is off (NF-03)', async () => {
++    const { service, writes, query } = serviceWith({ enabled: 'false' });
++
++    await expect(
++      service.run({ action: 'OPEN_FUSE', target: FUSE.custom_id }, ADMIN, NOW),
++    ).rejects.toThrow(ForbiddenException);
++    expect(query).not.toHaveBeenCalled();
++    expect(writes).toEqual([]);
++  });
++
++  it('OPEN_FUSE writes an open Falcon reading and a 13xx20 SET, both stamped now', async () => {
++    const { service, writes } = serviceWith();
++
++    const result = await service.run(
++      { action: 'OPEN_FUSE', target: FUSE.custom_id },
++      ADMIN,
++      NOW,
++    );
++
++    expect(result).toMatchObject({
++      action: 'OPEN_FUSE',
++      node: '0000100002',
++      target: '0000100002-A-R',
++      channel: null,
++      hw_id: '1301000004',
++      event_code: '131420',
++      event_type: 'SET',
++      recorded_at: NOW.toISOString(),
++    });
++    expect(writes).toEqual([
++      [
++        INSERT_FALCON_READING_SQL,
++        [
++          '1301000004',
++          '0000100002-A-R',
++          NOW.toISOString(),
++          'Abierto',
++          null,
++          true,
++          125,
++        ],
++      ],
++      [
++        INSERT_ALARM_SQL,
++        [
++          '1301000004',
++          '0000100002-A-R',
++          '131420',
++          'SET',
++          'Fusible abierto',
++          '125°',
++          NOW.toISOString(),
++        ],
++      ],
++    ]);
++  });
++
++  it('CUT_VOLTAGE and RESTORE_VOLTAGE change only the voltage flag', async () => {
++    const cut = serviceWith();
++    await cut.service.run(
++      { action: 'CUT_VOLTAGE', target: FUSE.custom_id },
++      ADMIN,
++      NOW,
++    );
++    expect(cut.writes[0][1].slice(3)).toEqual([null, false, null, null]);
++    expect(cut.writes[1][1][2]).toBe('131421');
++
++    const restore = serviceWith({ latest: 'SET' });
++    await restore.service.run(
++      { action: 'RESTORE_VOLTAGE', target: FUSE.custom_id },
++      ADMIN,
++      NOW,
++    );
++    expect(restore.writes[0][1].slice(3)).toEqual([null, true, null, null]);
++    expect(restore.writes[1][1].slice(2, 5)).toEqual([
++      '131421',
++      'CLEAR',
++      'Tensión normalizada',
++    ]);
++  });
++
++  it('DROP_PHASE writes 0 V and no current on that channel and a 05xx21y SET', async () => {
++    const { service, writes } = serviceWith({ firmware: '15' });
++
++    const result = await service.run(
++      { action: 'DROP_PHASE', target: TRAFO.custom_id, channel: 'B' },
++      ADMIN,
++      NOW,
++    );
++
++    expect(result.event_code).toBe('051521B');
++    expect(writes[0]).toEqual([
++      INSERT_SMAC_READING_SQL,
++      ['0501000001', '0000100004-T1-3', NOW.toISOString(), 'B', 0, true],
++    ]);
++    expect(writes[1][1].slice(2, 6)).toEqual([
++      '051521B',
++      'SET',
++      'Caída de la fase B',
++      '0',
++    ]);
++  });
++
++  it('RESTORE_PHASE writes 220 V back with a CLEAR', async () => {
++    const { service, writes } = serviceWith({ latest: 'SET', firmware: null });
++
++    await service.run(
++      { action: 'RESTORE_PHASE', target: TRAFO.custom_id, channel: 'A' },
++      ADMIN,
++      NOW,
++    );
++
++    expect(writes[0][1].slice(3)).toEqual(['A', 220, false]);
++    expect(writes[1][1].slice(2, 4)).toEqual(['051421A', 'CLEAR']);
++  });
++
++  it('refuses a phase the transformer does not have (CL-07)', async () => {
++    const { service, writes } = serviceWith();
++
++    await expect(
++      service.run(
++        { action: 'DROP_PHASE', target: TRAFO.custom_id, channel: 'C' },
++        ADMIN,
++        NOW,
++      ),
++    ).rejects.toThrow(/no phase on channel C/);
++    expect(writes).toEqual([]);
++  });
++
++  it('without any reading, the transformer id decides which channels exist', async () => {
++    const twoPhase = {
++      ...TRAFO,
++      custom_id: '0000100005-T1-2',
++      va: null,
++      vb: null,
++      vc: null,
++      has_reading: false,
++    };
++    await expect(
++      serviceWith({ trafo: twoPhase }).service.run(
++        { action: 'DROP_PHASE', target: twoPhase.custom_id, channel: 'C' },
++        ADMIN,
++        NOW,
++      ),
++    ).rejects.toThrow(BadRequestException);
++    await expect(
++      serviceWith({ trafo: twoPhase }).service.run(
++        { action: 'DROP_PHASE', target: twoPhase.custom_id, channel: 'B' },
++        ADMIN,
++        NOW,
++      ),
++    ).resolves.toMatchObject({ event_code: '051421B' });
++  });
++
++  it('409 for an action that repeats the current state (alarms first, then telemetry)', async () => {
++    await expect(
++      serviceWith({ latest: 'SET' }).service.run(
++        { action: 'OPEN_FUSE', target: FUSE.custom_id },
++        ADMIN,
++        NOW,
++      ),
++    ).rejects.toThrow(ConflictException);
++    await expect(
++      serviceWith().service.run(
++        { action: 'CLOSE_FUSE', target: FUSE.custom_id },
++        ADMIN,
++        NOW,
++      ),
++    ).rejects.toThrow(ConflictException);
++    await expect(
++      serviceWith({ fuse: { ...FUSE, fuse_state: 'Abierto' } }).service.run(
++        { action: 'OPEN_FUSE', target: FUSE.custom_id },
++        ADMIN,
++        NOW,
++      ),
++    ).rejects.toThrow(ConflictException);
++  });
++
++  it('404 for an unknown target or one outside the scope; 400 for a fuse without a Falcon', async () => {
++    await expect(
++      serviceWith({ fuse: null }).service.run(
++        { action: 'OPEN_FUSE', target: 'X' },
++        ADMIN,
++        NOW,
++      ),
++    ).rejects.toThrow(NotFoundException);
++    await expect(
++      serviceWith({ inScope: false }).service.run(
++        { action: 'OPEN_FUSE', target: FUSE.custom_id },
++        { kind: 'restricted', userId: 2 },
++        NOW,
++      ),
++    ).rejects.toThrow(NotFoundException);
++    await expect(
++      serviceWith({ fuse: { ...FUSE, hw_id: null } }).service.run(
++        { action: 'OPEN_FUSE', target: FUSE.custom_id },
++        ADMIN,
++        NOW,
++      ),
++    ).rejects.toThrow(/no Falcon/);
++  });
++
++  it.each([
++    [{ action: 'EXPLODE', target: 'x' }, /action must be one of/],
++    [{ action: 'OPEN_FUSE', target: '  ' }, /target is required/],
++    [{ action: 'DROP_PHASE', target: 'x' }, /needs channel/],
++    [{ action: 'OPEN_FUSE', target: 'x', channel: 'A' }, /takes no channel/],
++  ])('400 for an invalid body %p', async (body, message) => {
++    const { service, query } = serviceWith();
++
++    await expect(service.run(body as never, ADMIN, NOW)).rejects.toThrow(
++      message,
++    );
++    expect(query).not.toHaveBeenCalled();
++  });
++});
+diff --git a/backend/src/scenarios/scenarios.service.ts b/backend/src/scenarios/scenarios.service.ts
+new file mode 100644
+index 0000000..ebcf68c
+--- /dev/null
++++ b/backend/src/scenarios/scenarios.service.ts
+@@ -0,0 +1,397 @@
++import {
++  BadRequestException,
++  ConflictException,
++  ForbiddenException,
++  Injectable,
++  NotFoundException,
++} from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import { InjectRepository } from '@nestjs/typeorm';
++import { Repository } from 'typeorm';
++import { Node } from '../nodes/node.entity';
++import { phaseCountOf, phaseOfChannel } from '../nodes/transformer-state';
++import { applyNodeScope } from '../scope/scope-query.helper';
++import { ScopeContext } from '../scope/scope.types';
++import {
++  RunScenarioDto,
++  ScenarioResultDto,
++  ScenariosStatusDto,
++} from './dto/scenarios.dto';
++import {
++  CLOSED_FUSE_ANGLE,
++  DEFAULT_FIRMWARE,
++  DEMO_SCENARIOS_SETTING,
++  DROPPED_PHASE_VOLTS,
++  NOMINAL_PHASE_VOLTS,
++  OPEN_FUSE_ANGLE,
++  SCENARIO_ACTIONS,
++  SCENARIO_ACTION_NAMES,
++  ScenarioAction,
++  ScenarioChannel,
++  alarmTextOf,
++  alarmValueOf,
++  eventCodeOf,
++  expectedEffectOf,
++  isScenarioAction,
++  isScenarioChannel,
++  repeatsCurrentState,
++} from './scenario-actions';
++
++export const FUSE_TARGET_SQL = `
++  SELECT f.custom_id, f.current_hw_id AS hw_id, fs.node_id,
++         l.fuse_state, l.is_voltage_present
++  FROM public.fuses f
++  JOIN public.fuses_sets fs ON fs.id = f.fuses_set_id
++  LEFT JOIN public.last_falcon_values l ON l.hw_id = f.current_hw_id
++  WHERE f.custom_id = $1
++`;
++
++export const TRANSFORMER_TARGET_SQL = `
++  SELECT t.custom_id, t.current_hw_id AS hw_id, t.node_id, l.va, l.vb, l.vc,
++         (l.hw_id IS NOT NULL) AS has_reading
++  FROM public.trafos t
++  LEFT JOIN public.last_smac_vc_values l ON l.hw_id = t.current_hw_id
++  WHERE t.custom_id = $1
++`;
++
++/**
++ * Latest event of one alarm of the target (by custom_id, or by device when the event has none).
++ * At the same instant a SET wins, the same tie rule as the fault list.
++ */
++export const LATEST_EVENT_SQL = `
++  SELECT upper(a.event_type) AS event_type
++  FROM public.alarms a
++  WHERE (a.custom_id = $1 OR (a.custom_id IS NULL AND a.hw_id = $2))
++    AND a.event_code ~ $3
++    AND upper(a.event_type) IN ('SET', 'CLEAR')
++  ORDER BY a.recorded_at DESC, (upper(a.event_type) = 'SET') DESC
++  LIMIT 1
++`;
++
++/** Firmware digits of the device's latest event, so new codes look like its own. */
++export const FIRMWARE_SQL = `
++  SELECT substring(a.event_code FROM 3 FOR 2) AS firmware
++  FROM public.alarms a
++  WHERE a.hw_id = $1 AND a.event_code ~ '^(13|05)[0-9]{2}'
++  ORDER BY a.recorded_at DESC
++  LIMIT 1
++`;
++
++/** New Falcon reading: the latest one with the fuse or voltage state changed ($4-$6 null = keep). */
++export const INSERT_FALCON_READING_SQL = `
++  INSERT INTO public.falcon_values (
++    hw_id, custom_id, post, recorded_at, angle_incl, internal_temperature, supercaps_per,
++    solar_panel, fuse_state, is_voltage_present, is_fuse_alarm, is_free_fall_alarm,
++    is_solar_panel_alarm)
++  SELECT $1, $2, l.post, $3::timestamptz, COALESCE($7::float8, l.angle_incl),
++         l.internal_temperature, l.supercaps_per, l.solar_panel,
++         COALESCE($4::text, l.fuse_state, 'Cerrado'),
++         COALESCE($5::boolean, l.is_voltage_present, true),
++         COALESCE($6::boolean, l.is_fuse_alarm, false),
++         COALESCE(l.is_free_fall_alarm, false), COALESCE(l.is_solar_panel_alarm, false)
++  FROM (SELECT 1) AS one
++  LEFT JOIN public.last_falcon_values l ON l.hw_id = $1
++`;
++
++/** New SMAC reading: the latest one with the voltage of channel $4 set to $5. */
++export const INSERT_SMAC_READING_SQL = `
++  INSERT INTO public.smac_vc_values (
++    hw_id, custom_id, recorded_at, internal_temperature, battery_per, va, vb, vc,
++    ia, ib, ic, in_, cuf_percent, vuf_percent, load_percent)
++  SELECT $1, $2, $3::timestamptz, l.internal_temperature, l.battery_per,
++         CASE WHEN $4 = 'A' THEN $5::float8 ELSE l.va END,
++         CASE WHEN $4 = 'B' THEN $5::float8 ELSE l.vb END,
++         CASE WHEN $4 = 'C' THEN $5::float8 ELSE l.vc END,
++         CASE WHEN $4 = 'A' AND $6 THEN 0 ELSE l.ia END,
++         CASE WHEN $4 = 'B' AND $6 THEN 0 ELSE l.ib END,
++         CASE WHEN $4 = 'C' AND $6 THEN 0 ELSE l.ic END,
++         l.in_, l.cuf_percent, l.vuf_percent, l.load_percent
++  FROM (SELECT 1) AS one
++  LEFT JOIN public.last_smac_vc_values l ON l.hw_id = $1
++`;
++
++export const INSERT_ALARM_SQL = `
++  INSERT INTO public.alarms (hw_id, custom_id, event_code, event_type, alarm, value, recorded_at)
++  VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz)
++`;
++
++interface FuseTarget {
++  custom_id: string;
++  hw_id: string | null;
++  node_id: string;
++  fuse_state: string | null;
++  is_voltage_present: boolean | null;
++}
++
++interface TransformerTarget {
++  custom_id: string;
++  hw_id: string | null;
++  node_id: string;
++  va: number | null;
++  vb: number | null;
++  vc: number | null;
++  has_reading: boolean;
++}
++
++/** US31 · F-100 (SCRUM-252): demo scenarios that make a device report a fault or its recovery. */
++@Injectable()
++export class ScenariosService {
++  constructor(
++    @InjectRepository(Node)
++    private readonly nodesRepository: Repository<Node>,
++    private readonly configService: ConfigService,
++  ) {}
++
++  /** Demo mode is on only when the setting is exactly "true" (NF-03: off everywhere else). */
++  enabled(): boolean {
++    return (
++      String(this.configService.get(DEMO_SCENARIOS_SETTING) ?? '')
++        .trim()
++        .toLowerCase() === 'true'
++    );
++  }
++
++  status(): ScenariosStatusDto {
++    return {
++      enabled: this.enabled(),
++      actions: SCENARIO_ACTION_NAMES.map((action) => ({
++        action,
++        target:
++          SCENARIO_ACTIONS[action].device === 'FALCON' ? 'FUSE' : 'TRANSFORMER',
++        channel_required: SCENARIO_ACTIONS[action].channel,
++        effect: expectedEffectOf(action),
++      })),
++    };
++  }
++
++  async run(
++    body: RunScenarioDto,
++    scope: ScopeContext,
++    now: Date = new Date(),
++  ): Promise<ScenarioResultDto> {
++    if (!this.enabled()) {
++      throw new ForbiddenException(
++        'Demo scenarios are disabled in this environment',
++      );
++    }
++    const { action, target, channel } = parseBody(body);
++    const definition = SCENARIO_ACTIONS[action];
++
++    const resolved =
++      definition.device === 'FALCON'
++        ? await this.fuseTarget(target)
++        : await this.transformerTarget(target, channel as ScenarioChannel);
++    await this.assertInScope(resolved.nodeId, scope);
++
++    const active = await this.isActive(action, resolved, channel);
++    if (repeatsCurrentState(action, active)) {
++      throw new ConflictException(
++        `${action} would not change anything: the ${definition.device === 'FALCON' ? 'fuse' : 'phase'} is already in that state`,
++      );
++    }
++
++    const firmware = await this.firmwareOf(resolved.hwId);
++    const eventCode = eventCodeOf(action, firmware, channel);
++    const recordedAt = now.toISOString();
++
++    await this.nodesRepository.manager.transaction(async (manager) => {
++      if (definition.device === 'FALCON') {
++        await manager.query(INSERT_FALCON_READING_SQL, [
++          resolved.hwId,
++          target,
++          recordedAt,
++          ...falconOverrides(action),
++        ]);
++      } else {
++        const drop = action === 'DROP_PHASE';
++        await manager.query(INSERT_SMAC_READING_SQL, [
++          resolved.hwId,
++          target,
++          recordedAt,
++          channel,
++          drop ? DROPPED_PHASE_VOLTS : NOMINAL_PHASE_VOLTS,
++          drop,
++        ]);
++      }
++      await manager.query(INSERT_ALARM_SQL, [
++        resolved.hwId,
++        target,
++        eventCode,
++        definition.eventType,
++        alarmTextOf(action, channel),
++        alarmValueOf(action),
++        recordedAt,
++      ]);
++    });
++
++    return {
++      action,
++      node: resolved.nodeId,
++      target,
++      channel,
++      hw_id: resolved.hwId,
++      event_code: eventCode,
++      event_type: definition.eventType,
++      recorded_at: recordedAt,
++      effect: expectedEffectOf(action),
++    };
++  }
++
++  private async fuseTarget(target: string): Promise<ResolvedTarget> {
++    const [fuse]: FuseTarget[] = await this.nodesRepository.query(
++      FUSE_TARGET_SQL,
++      [target],
++    );
++    if (!fuse) throw new NotFoundException(`Fuse ${target} not found`);
++    if (!fuse.hw_id) {
++      throw new BadRequestException(`Fuse ${target} has no Falcon installed`);
++    }
++    return {
++      targetId: fuse.custom_id,
++      nodeId: fuse.node_id,
++      hwId: fuse.hw_id,
++      fuseOpenInTelemetry: fuse.fuse_state === 'Abierto',
++      voltageCutInTelemetry: fuse.is_voltage_present === false,
++    };
++  }
++
++  private async transformerTarget(
++    target: string,
++    channel: ScenarioChannel,
++  ): Promise<ResolvedTarget> {
++    const [trafo]: TransformerTarget[] = await this.nodesRepository.query(
++      TRANSFORMER_TARGET_SQL,
++      [target],
++    );
++    if (!trafo) throw new NotFoundException(`Transformer ${target} not found`);
++    if (!trafo.hw_id) {
++      throw new BadRequestException(
++        `Transformer ${target} has no SMAC installed`,
++      );
++    }
++    if (!hasChannel(trafo, channel)) {
++      throw new BadRequestException(
++        `Transformer ${target} has no phase on channel ${channel}`,
++      );
++    }
++    return {
++      targetId: trafo.custom_id,
++      nodeId: trafo.node_id,
++      hwId: trafo.hw_id,
++      fuseOpenInTelemetry: false,
++      voltageCutInTelemetry: false,
++    };
++  }
++
++  /** A node outside the user's scope gives the same 404 as one that does not exist (F-10). */
++  private async assertInScope(
++    nodeName: string,
++    scope: ScopeContext,
++  ): Promise<void> {
++    const query = this.nodesRepository
++      .createQueryBuilder('node')
++      .where('node.name = :nodeName', { nodeName });
++    applyNodeScope(query, 'node.name', scope);
++    if ((await query.getCount()) === 0) {
++      throw new NotFoundException('Target not found');
++    }
++  }
++
++  /** Current state from the alarms (the platform's source of truth, CL-01); telemetry if none. */
++  private async isActive(
++    action: ScenarioAction,
++    target: ResolvedTarget,
++    channel: ScenarioChannel | null,
++  ): Promise<boolean> {
++    const { device, event } = SCENARIO_ACTIONS[action];
++    const pattern =
++      device === 'FALCON'
++        ? `^13[0-9]{2}${event}$`
++        : `^05[0-9]{2}${event}(${channel}|${'ABC'.indexOf(channel as string) + 1})$`;
++    const rows: { event_type: string }[] = await this.nodesRepository.query(
++      LATEST_EVENT_SQL,
++      [target.targetId, target.hwId, pattern],
++    );
++    if (rows.length > 0) return rows[0].event_type === 'SET';
++    if (device === 'SMAC') return false;
++    return event === '20'
++      ? target.fuseOpenInTelemetry
++      : target.voltageCutInTelemetry;
++  }
++
++  private async firmwareOf(hwId: string): Promise<string> {
++    const rows: { firmware: string }[] = await this.nodesRepository.query(
++      FIRMWARE_SQL,
++      [hwId],
++    );
++    const firmware = rows[0]?.firmware;
++    return firmware && /^\d{2}$/.test(firmware) ? firmware : DEFAULT_FIRMWARE;
++  }
++}
++
++interface ResolvedTarget {
++  /** Stable custom_id of the fuse or transformer. */
++  targetId: string;
++  nodeId: string;
++  hwId: string;
++  fuseOpenInTelemetry: boolean;
++  voltageCutInTelemetry: boolean;
++}
++
++function parseBody(body: RunScenarioDto | undefined): {
++  action: ScenarioAction;
++  target: string;
++  channel: ScenarioChannel | null;
++} {
++  const raw = (body ?? {}) as Partial<Record<keyof RunScenarioDto, unknown>>;
++  if (!isScenarioAction(raw.action)) {
++    throw new BadRequestException(
++      `action must be one of ${SCENARIO_ACTION_NAMES.join(', ')}`,
++    );
++  }
++  if (typeof raw.target !== 'string' || raw.target.trim() === '') {
++    throw new BadRequestException('target is required');
++  }
++  const needsChannel = SCENARIO_ACTIONS[raw.action].channel;
++  if (needsChannel && !isScenarioChannel(raw.channel)) {
++    throw new BadRequestException(`${raw.action} needs channel A, B or C`);
++  }
++  if (!needsChannel && raw.channel !== undefined && raw.channel !== null) {
++    throw new BadRequestException(`${raw.action} takes no channel`);
++  }
++  return {
++    action: raw.action,
++    target: raw.target.trim(),
++    channel: needsChannel ? (raw.channel as ScenarioChannel) : null,
++  };
++}
++
++/** $4 fuse_state, $5 is_voltage_present, $6 is_fuse_alarm, $7 angle_incl (null = keep). */
++function falconOverrides(
++  action: ScenarioAction,
++): [string | null, boolean | null, boolean | null, number | null] {
++  switch (action) {
++    case 'OPEN_FUSE':
++      return ['Abierto', null, true, OPEN_FUSE_ANGLE];
++    case 'CLOSE_FUSE':
++      return ['Cerrado', null, false, CLOSED_FUSE_ANGLE];
++    case 'CUT_VOLTAGE':
++      return [null, false, null, null];
++    default:
++      return [null, true, null, null];
++  }
++}
++
++/** A channel exists when its voltage is stated; without a reading, the id's phase count decides. */
++function hasChannel(
++  trafo: TransformerTarget,
++  channel: ScenarioChannel,
++): boolean {
++  if (trafo.has_reading) {
++    const volts = { A: trafo.va, B: trafo.vb, C: trafo.vc }[channel];
++    return volts !== null && volts !== undefined;
++  }
++  const count = phaseCountOf(trafo.custom_id);
++  const phase = phaseOfChannel(channel);
++  return count === null || (phase !== null && phase <= count);
++}
+diff --git a/backend/test/scenarios.e2e-spec.ts b/backend/test/scenarios.e2e-spec.ts
+new file mode 100644
+index 0000000..afa0d7d
+--- /dev/null
++++ b/backend/test/scenarios.e2e-spec.ts
+@@ -0,0 +1,213 @@
++import { randomBytes } from 'node:crypto';
++import * as bcrypt from 'bcrypt';
++import request from 'supertest';
++import { DataSource } from 'typeorm';
++import { ActiveFaultsService } from '../src/faults/active-faults.service';
++import { NodesService } from '../src/nodes/nodes.service';
++import {
++  IsolatedApp,
++  createFalconNodes,
++  createSmacNodes,
++  removeFalconNodes,
++  removeSmacNodes,
++  startIsolatedApp,
++  stopIsolatedApp,
++} from './support/isolated-e2e';
++
++// US31 · F-100 (SCRUM-252) against a real database and through HTTP: each scenario writes what a
++// device would send, and the map (GET /nodes) and the alarm list (GET /faults) react through
++// their normal rules. Demo mode is turned on for this app only.
++
++const LABEL = 'US31';
++const PASSWORD = randomBytes(12).toString('hex');
++const ADMIN = 'scn-e2e-admin@test.local';
++const CONSULTATION = 'scn-e2e-consult@test.local';
++const FALCON_NODE = 'SCNE2E0001';
++const SMAC_NODE = 'SCNE2E0002';
++const FUSES = ['R', 'S', 'T'].map((phase, i) => ({
++  customId: `${FALCON_NODE}-${phase}`,
++  phase,
++  hwId: `13E2ESC00${i + 1}`,
++  reading: { hoursAgo: 0.5, fuseState: 'Cerrado', isVoltagePresent: true },
++}));
++const TRAFO = { customId: `${SMAC_NODE}-T1-3`, hwId: '05E2ESC004' };
++const HW_IDS = [...FUSES.map((f) => f.hwId), TRAFO.hwId];
++
++async function remove(dataSource: DataSource): Promise<void> {
++  await dataSource.query('DELETE FROM alarms WHERE hw_id = ANY($1)', [HW_IDS]);
++  await removeFalconNodes(
++    dataSource,
++    [FALCON_NODE],
++    FUSES.map((f) => f.hwId),
++  );
++  await removeSmacNodes(dataSource, [SMAC_NODE], [TRAFO.hwId]);
++  await dataSource.query('DELETE FROM users WHERE username = ANY($1)', [
++    [ADMIN, CONSULTATION],
++  ]);
++}
++
++async function create(dataSource: DataSource): Promise<void> {
++  const hash = await bcrypt.hash(PASSWORD, 10);
++  await dataSource.query(
++    `INSERT INTO users (username, password_hash, role, is_active)
++     VALUES ($1, $3, 'Colbits administrator', TRUE), ($2, $3, 'consultation user', TRUE)`,
++    [ADMIN, CONSULTATION, hash],
++  );
++  await createFalconNodes(
++    dataSource,
++    [{ node: FALCON_NODE, fuseSetId: 990_300, fuses: FUSES }],
++    1,
++  );
++  await createSmacNodes(
++    dataSource,
++    [
++      {
++        node: SMAC_NODE,
++        transformers: [
++          { customId: TRAFO.customId, hwId: TRAFO.hwId, readings: [] },
++        ],
++      },
++    ],
++    1,
++  );
++  await dataSource.query(
++    `INSERT INTO smac_vc_values (hw_id, custom_id, recorded_at, va, vb, vc, battery_per)
++     VALUES ($1, $2, now() - interval '20 minutes', 220, 221, 219, 90)`,
++    [TRAFO.hwId, TRAFO.customId],
++  );
++}
++
++describe('US31 demo scenarios (e2e)', () => {
++  let started: IsolatedApp | undefined;
++  let adminToken = '';
++  let consultationToken = '';
++
++  beforeAll(async () => {
++    process.env.DEMO_SCENARIOS_ENABLED = 'true';
++    started = await startIsolatedApp(LABEL, { remove, create });
++    const login = async (username: string) =>
++      (
++        await request(started!.app.getHttpServer())
++          .post('/auth/login')
++          .send({ username, password: PASSWORD })
++          .expect(200)
++      ).body.access_token as string;
++    adminToken = await login(ADMIN);
++    consultationToken = await login(CONSULTATION);
++  });
++
++  afterAll(async () => {
++    await stopIsolatedApp(started, LABEL, remove);
++    delete process.env.DEMO_SCENARIOS_ENABLED;
++  });
++
++  const run = (body: object, token = adminToken) =>
++    request(started!.app.getHttpServer())
++      .post('/scenarios')
++      .set('Authorization', `Bearer ${token}`)
++      .send(body);
++
++  const node = async (name: string) =>
++    (
++      await started!.app.get(NodesService).findAll({ kind: 'unrestricted' })
++    ).nodes.find((n) => n.name === name);
++
++  const activeTypes = async (name: string) =>
++    (
++      await started!.app
++        .get(ActiveFaultsService)
++        .activeFaults({ kind: 'unrestricted' })
++    ).faults
++      .filter((f) => f.node === name)
++      .map((f) => f.alert_type)
++      .sort((a, b) => a.localeCompare(b));
++
++  it('GET /scenarios says demo mode is on and lists the actions', async () => {
++    const response = await request(started!.app.getHttpServer())
++      .get('/scenarios')
++      .set('Authorization', `Bearer ${adminToken}`)
++      .expect(200);
++
++    expect(response.body.enabled).toBe(true);
++    expect(response.body.actions).toHaveLength(6);
++  });
++
++  it('OPEN_FUSE turns the node red and opens a FUSE_OPENING fault; repeating it is refused', async () => {
++    const response = await run({
++      action: 'OPEN_FUSE',
++      target: FUSES[0].customId,
++    }).expect(201);
++
++    expect(response.body).toMatchObject({
++      node: FALCON_NODE,
++      event_code: '131420',
++      event_type: 'SET',
++    });
++    expect((await node(FALCON_NODE))?.fuse_state).toBe('CRITICAL');
++    expect(await activeTypes(FALCON_NODE)).toEqual(['FUSE_OPENING']);
++
++    await run({ action: 'OPEN_FUSE', target: FUSES[0].customId }).expect(409);
++  });
++
++  it('CLOSE_FUSE resolves the fault and the node is green again', async () => {
++    await run({ action: 'CLOSE_FUSE', target: FUSES[0].customId }).expect(201);
++
++    expect((await node(FALCON_NODE))?.fuse_state).toBe('NORMAL');
++    expect(await activeTypes(FALCON_NODE)).toEqual([]);
++  });
++
++  it('CUT_VOLTAGE turns the node yellow with a NO_VOLTAGE alarm; RESTORE_VOLTAGE clears it', async () => {
++    await run({ action: 'CUT_VOLTAGE', target: FUSES[1].customId }).expect(201);
++    expect((await node(FALCON_NODE))?.fuse_state).toBe('WARNING');
++    expect(await activeTypes(FALCON_NODE)).toEqual(['NO_VOLTAGE']);
++
++    await run({ action: 'RESTORE_VOLTAGE', target: FUSES[1].customId }).expect(
++      201,
++    );
++    expect((await node(FALCON_NODE))?.fuse_state).toBe('NORMAL');
++    expect(await activeTypes(FALCON_NODE)).toEqual([]);
++  });
++
++  it('DROP_PHASE: one phase is yellow, two are red, with PHASE_LOSS alarms; RESTORE_PHASE recovers', async () => {
++    await run({
++      action: 'DROP_PHASE',
++      target: TRAFO.customId,
++      channel: 'A',
++    }).expect(201);
++    expect((await node(SMAC_NODE))?.transformer_state).toBe('WARNING');
++
++    await run({
++      action: 'DROP_PHASE',
++      target: TRAFO.customId,
++      channel: 'B',
++    }).expect(201);
++    expect((await node(SMAC_NODE))?.transformer_state).toBe('CRITICAL');
++    expect(await activeTypes(SMAC_NODE)).toEqual(['PHASE_LOSS', 'PHASE_LOSS']);
++
++    await run({
++      action: 'RESTORE_PHASE',
++      target: TRAFO.customId,
++      channel: 'A',
++    }).expect(201);
++    await run({
++      action: 'RESTORE_PHASE',
++      target: TRAFO.customId,
++      channel: 'B',
++    }).expect(201);
++    expect((await node(SMAC_NODE))?.transformer_state).toBe('NORMAL');
++    expect(await activeTypes(SMAC_NODE)).toEqual([]);
++  });
++
++  it('refuses a consultation user, an unknown target and a bad body', async () => {
++    await run(
++      { action: 'OPEN_FUSE', target: FUSES[2].customId },
++      consultationToken,
++    ).expect(403);
++    await run({ action: 'OPEN_FUSE', target: 'NOPE-R' }).expect(404);
++    await run({ action: 'DROP_PHASE', target: TRAFO.customId }).expect(400);
++    await request(started!.app.getHttpServer())
++      .post('/scenarios')
++      .send({})
++      .expect(401);
++  });
++});
+diff --git a/docker-compose.yml b/docker-compose.yml
+index b7c64f3..ef69564 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -66,6 +66,8 @@ services:
+       CHOKIDAR_USEPOLLING: 'true'
+       FALCON_LOW_ENERGY_PERCENT: ${FALCON_LOW_ENERGY_PERCENT:-30}
+       SMAC_LOW_ENERGY_PERCENT: ${SMAC_LOW_ENERGY_PERCENT:-30}
++      # Local data comes from the generator, so the demo scenario panel is on (US31).
++      DEMO_SCENARIOS_ENABLED: ${DEMO_SCENARIOS_ENABLED:-true}
+       SMAC_OVERLOAD_PERCENT: ${SMAC_OVERLOAD_PERCENT:-90}
+       SMAC_VOLTAGE_UNBALANCE_PERCENT: ${SMAC_VOLTAGE_UNBALANCE_PERCENT:-2}
+       # Empty = disabled: TD-10 has no approved current-imbalance threshold yet.
+diff --git a/docs/bitacora-ia/2026-11-15-SCRUM-252.md b/docs/bitacora-ia/2026-11-15-SCRUM-252.md
+new file mode 100644
+index 0000000..6061134
+--- /dev/null
++++ b/docs/bitacora-ia/2026-11-15-SCRUM-252.md
+@@ -0,0 +1,23 @@
++# AI log — SCRUM-252 (US31 · F-100 demo scenarios: fuse, voltage, phase) — 2026-11-15
++
++**Author:** Yeison Delgado · **Tool:** Claude (Claude Code)
++
++## What the AI generated
++- `backend/src/scenarios/`: `GET /scenarios` (demo mode and the actions) and `POST /scenarios`
++  (OPEN_FUSE, CLOSE_FUSE, CUT_VOLTAGE, RESTORE_VOLTAGE, DROP_PHASE, RESTORE_PHASE), with Swagger DTOs.
++- `scenario-actions.ts`: one registry with what each action writes, so SCRUM-253 can add its actions there.
++- Unit tests for the actions, the service and the controller; e2e test `test/scenarios.e2e-spec.ts` over HTTP.
++- `DEMO_SCENARIOS_ENABLED`: `.env.example` (false), local `docker-compose.yml` (true), Render staging (true),
++  Render production (false).
++
++## What I did / reviewed
++- A scenario writes what the device would send: one telemetry reading and one alarm event with the
++  Technical Annex §4.2 code (13xx20, 13xx21, 05xx21y), SET or CLEAR. Nothing in the state or fault logic
++  changes, so the map, the alarm list and the node detail react through their normal rules.
++- Safety (NF-03): off unless `DEMO_SCENARIOS_ENABLED=true`; only Colbits administrators; scope applied;
++  a repeated action (opening an open fuse) is refused with 409 so SET/CLEAR pairs stay consistent;
++  a phase the transformer does not have is refused (CL-07).
++- Ran: 729 unit tests, lint, build, Prettier; e2e on PostgreSQL with Colbits' triggers (176 + 3, 6 new):
++  OPEN_FUSE → node CRITICAL + FUSE_OPENING fault, CLOSE_FUSE → NORMAL and no fault, CUT_VOLTAGE → WARNING +
++  NO_VOLTAGE, one dropped phase → WARNING, two → CRITICAL + two PHASE_LOSS, restores → NORMAL; 403 for a
++  consultation user, 404, 400, 401. Duplication check: 0 clones.
+diff --git a/render.yaml b/render.yaml
+index dc1f4d7..8f8401e 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -52,6 +52,8 @@ services:
+         value: '30'
+       - key: SMAC_LOW_ENERGY_PERCENT
+         value: '30'
++      - key: DEMO_SCENARIOS_ENABLED
++        value: 'false'
+       - key: SMAC_OVERLOAD_PERCENT
+         value: '90'
+       - key: SMAC_VOLTAGE_UNBALANCE_PERCENT
+@@ -121,6 +123,8 @@ services:
+         value: '30'
+       - key: SMAC_LOW_ENERGY_PERCENT
+         value: '30'
++      - key: DEMO_SCENARIOS_ENABLED
++        value: 'true'
+       - key: SMAC_OVERLOAD_PERCENT
+         value: '90'
+       - key: SMAC_VOLTAGE_UNBALANCE_PERCENT
+-- 
+2.43.0
+
