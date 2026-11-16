@@ -49,13 +49,21 @@ Problemas de integración nuevos (tu parte):
 |---|---|---|
 | Yeison | My backend tasks blocked others: the scenario panel and the inactive-device list waited for my endpoints, and Javier's scenarios built on mine. I also did not answer on Slack fast enough. | I published the API contract first, built the scenario service so others could add to it, and tested each endpoint end to end before handing it over. Now I check Slack every day. |
 
-## 6. Sección 11 y tablas de carga (Sprint 4 y 5) · **tus horas**
-Esto solo lo sabes tú. Mándame más o menos cuántas horas le dedicaste en cada categoría y te armo las tres filas:
-- Total desde el inicio.
-- Sprint 4.
-- Sprint 5.
+## 6. Sección 11 y tablas de carga (Sprint 4 y 5) · tus horas (estimadas)
+Nadie más ha puesto sus horas en el doc todavía, así que estas son estimaciones. Salen de lo que se sabe:
+- Reuniones: unas 2,5 h por semana, que es lo que usa Sofía (5 h por sprint).
+- Pruebas del Sprint 4: 1,5 h, el número que te puso Sofía.
+- Lo demás sale de tus tareas en Jira.
 
-Las categorías son: Meetings, Documentation, Presentation, Research, Implementation, Testing y Scrum.
+| Tabla | Meetings | Documentation | Presentation | Research | Implementation | Testing | Scrum | Total |
+|---|---|---|---|---|---|---|---|---|
+| **Sección 11 (total desde el inicio)** | 25 | 8 | 7 | 8 | 30 | 7 | 6 | **91** |
+| **Sprint 4** | 5 | 1 | 3 | 2 | 10 | 1.5 | 1.5 | 24 |
+| **Sprint 5** | 5 | 2 | 2 | 2 | 12 | 4 | 1.5 | 28.5 |
+
+- **Ojo:** si en `COLBITS_Sprint_Backlog.xlsx` ya tienes otras horas en el Sprint 4, usa esas para que cuadren.
+- **Sofía pidió hoy las horas del Sprint 5 por categoría.** Mándale este mensaje por DM o en el hilo:
+> Hi Sofía! My Sprint 5 hours: Meetings 5, Documentation 2, Presentation 2, Research 2, Implementation 12, Testing 4, Scrum 1.5 (28.5 h). Total since the start: 91 h. I'm filling them in the Beta doc too 🙌
 
 ## 7. Sección 12 · Demo ("TO FILL · Mahmoud and Jason")
 Propuesta para cuadrar con Mahmoud:
