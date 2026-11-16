@@ -1,0 +1,37 @@
+From 23c0a47ae63b5529d717abb1d197de51e9d5da71 Mon Sep 17 00:00:00 2001
+From: Yeison Delgado <yeisonestivendelgado109@gmail.com>
+Date: Mon, 16 Nov 2026 01:44:45 +0000
+Subject: [PATCH] chore(deploy): turn on the demo scenario panel on the Beta
+ server (US31)
+
+The PO asked for the scenario panel on dev.colbits.com.co for the Beta
+demo. That server only holds generator data (Colbits, 29 Oct), so the
+backend gets DEMO_SCENARIOS_ENABLED=true and, for the SCRUM-253 guard,
+DEMO_SCENARIOS_DATABASE=colbits, as docs/demo-scenarios.md describes.
+Production on Render stays off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012Za94ATKRpuhbxLyQmG5TG
+---
+ deploy/docker-compose.yml | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/deploy/docker-compose.yml b/deploy/docker-compose.yml
+index 742c17d..149977b 100644
+--- a/deploy/docker-compose.yml
++++ b/deploy/docker-compose.yml
+@@ -50,6 +50,11 @@ services:
+       SMAC_VOLTAGE_UNBALANCE_PERCENT: 2
+       # SMAC_CURRENT_UNBALANCE_PERCENT is left unset on purpose: TD-10 has no approved value, so the
+       # current-imbalance condition is disabled. Add it here once the team agrees one.
++      # Demo scenario panel (US31) for the Beta demo, asked by the PO (Paola, 15 Nov). This server only holds
++      # generator data (Colbits, 29 Oct), never Colbits' real data (NF-03). With SCRUM-253 the database must
++      # also be named here and carry the synthetic-dataset marker (docs/demo-scenarios.md).
++      DEMO_SCENARIOS_ENABLED: 'true'
++      DEMO_SCENARIOS_DATABASE: colbits
+     depends_on:
+       db:
+         condition: service_healthy
+-- 
+2.43.0
+
