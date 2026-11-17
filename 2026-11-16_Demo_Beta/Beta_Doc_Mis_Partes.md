@@ -24,11 +24,26 @@ Contesté las cinco con lo que hay en el repo. Si Javier o Mahmoud ya escribiero
 ## 2. Sección 5 · una línea de cambio "que el usuario no ve" ("TO FILL · Javier, Yeison, Mahmoud")
 > Yeison: the inactive-device list, the low-energy alerts and the demo scenarios are computed from the stored timestamps, with no new tables in Colbits' schema; every endpoint applies the user's scope in SQL, and the thresholds (inactivity 9 h / 3 h, low energy 30 %) are settings, not code.
 
-## 3. Sección 7 · Riesgos · dos celdas "Result?" de la tabla
+## 3. Sección 7 · Riesgos (Mahmoud te pidió toda la sección)
+**a) Las dos celdas "Result?" de la tabla:**
 - **Backend technology change (FastAPI to NestJS):** "No problem. One language everywhere; the only cost was moving everyone and CI to Node 24, which NestJS needs."
 - **Security gaps found while integrating:** "Fixed. Every endpoint applies the user's scope in SQL and answers 404 outside it, with tests for each case. No known open gap."
 
-(La tabla inicial de riesgos la ponen Paola y Sofía; tú la presentas.)
+**b) La tabla inicial de la primera presentación.** No está en los archivos, pero el mismo doc nombra los tres riesgos: risk 1, 2 y 3. Pégala arriba de la tabla así:
+| # | Initial risk (first presentation) | What happened |
+|---|---|---|
+| 1 | No access to real data (read-only database) | Did not block us: the generator creates every case. |
+| 2 | Too much scope for a part-time student team | It happened: Sprint 5 closed 16 of 32 points, and we ranked the backlog again. |
+| 3 | Confidential client data exposure | It did not happen: demos use generated data only. |
+
+**c) Riesgos que no vimos venir.** Agrega estas 3 filas al final de la tabla (columnas: Risk | Foreseen? | What we did | Outcome):
+| Risk | Foreseen? | What we did | Outcome |
+|---|---|---|---|
+| Most pull requests merged in the last days of the sprint | No | Smaller PRs and merging `develop` before pushing; one approval per PR | Conflicts and repeated approvals in Sprint 5; we now merge during the sprint |
+| The Beta server needed its own settings for the demo | No | A small PR turns on demo mode on dev.colbits.com.co, only with generated data | Fixed before the Beta demo |
+| Jira did not show the real state of the work | No | Move the task as soon as it is merged and log the hours then | Jira was brought up to date on 16 Nov |
+
+**d) Borra la línea amarilla** "TO FILL · Paola and Ana Sofía…". Las filas candidatas que ya estaban en la tabla se quedan, porque todas aplican.
 
 ## 4. Sección 9 · Pruebas ("TO FILL · Javier and Yeison" + problemas de integración)
 Tabla, columna **Beta (now)**:
